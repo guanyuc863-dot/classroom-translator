@@ -59,7 +59,7 @@ const STT_SERVICES = {
 const DEFAULTS = {
   llmProvider: 'openai', sttProvider: 'openai', keys: {}, volcAppId: '',
   llmBase: '', trModel: '', qaModel: '', sttBase: '', sttModel: '',      // empty = the service's default
-  direction: 'en2zh', course: '', glossary: '', noAI: false, silenceMs: 700, autoSum: true, saveAudio: true, source: 'mic',
+  direction: 'en2zh', course: '', glossary: '', noAI: false, pace: 'fast', autoSum: true, saveAudio: true, source: 'mic',
 };
 const DIRECTION_LABEL = { en2zh: '英 → 中', zh2en: '中 → 英', auto: '中英自动互译' };
 const GAP_REASON = {
@@ -151,7 +151,8 @@ function loadSettings() {
   delete s.baseUrl;
   if (!LLM_SERVICES[s.llmProvider]) s.llmProvider = 'openai';
   if (!STT_SERVICES[s.sttProvider]) s.sttProvider = 'openai';
-  s.silenceMs = Number(s.silenceMs) || DEFAULTS.silenceMs;
+  if (!PACES[s.pace]) s.pace = 'fast';
+  delete s.silenceMs;
   return s;
 }
 const llmSvc = (set = S.set) => LLM_SERVICES[set.llmProvider] || LLM_SERVICES.openai;
@@ -753,9 +754,40 @@ function makeContext() {
   const AC = window.AudioContext || window.webkitAudioContext;
   return new AC({ latencyHint: 'interactive' });       // created inside the tap, so iPadOS lets it run
 }
+/* Three ways to start the microphone, because iPadOS Safari is particular about Web Audio:
+   "worklet"       audio context made in the tap, then the microphone, then an AudioWorklet (desktop default)
+   "worklet-late"  microphone first, then a new audio context (allowed once the page is capturing)
+   "script"        microphone first, then the older ScriptProcessor instead of an AudioWorklet
+   If no sound arrives within 2.5 s the next way is tried by itself; the one that worked is remembered.
+   iPad: the system's own voice processing stays on (turning echo cancellation off can give a silent
+   first stream on iPad); computers: raw sound, better for a lecturer across the room. */
+const CAPTURE_MODES = ['worklet', 'worklet-late', 'script'];
+function micConstraints() {
+  return PLATFORM.ios ? { audio: true }
+    : { audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } };
+}
+// box-filter decimation to 16 kHz in 100 ms pieces of int16 (same as pcm-worklet.js), for the ScriptProcessor way
+function makeDecimator(rate, onPcm) {
+  const ratio = rate / SR;
+  let out = new Int16Array(1600), n = 0, acc = 0, accN = 0, phase = 0, sq = 0;
+  const push = (v) => {
+    const x = v > 1 ? 1 : v < -1 ? -1 : v;
+    out[n++] = x < 0 ? x * 32768 : x * 32767;
+    sq += x * x;
+    if (n === out.length) { onPcm(out, Math.sqrt(sq / n)); out = new Int16Array(1600); n = 0; sq = 0; }
+  };
+  return (data) => {
+    for (let i = 0; i < data.length; i++) {
+      if (ratio === 1) { push(data[i]); continue; }
+      acc += data[i]; accN++; phase += 1;
+      if (phase >= ratio) { phase -= ratio; push(acc / accN); acc = 0; accN = 0; }
+    }
+  };
+}
 // source "mic": the microphone; "system": a shared tab or screen with its sound (online classes, videos),
 // desktop Chrome/Edge only. Called straight from a tap: both need a user action.
-async function openCapture(ctx, onPcm, source = 'mic') {
+// `warm`: ctx was made while the page was already capturing (a retry), so the late ways can keep it.
+async function openCapture(ctx, onPcm, source = 'mic', mode = 'worklet', warm = false) {
   let stream;
   try {
     if (source === 'system') {
@@ -770,31 +802,130 @@ async function openCapture(ctx, onPcm, source = 'mic') {
         throw e;
       }
     } else {
-      // no echo cancellation / noise suppression: the call processing of tablets and laptops is tuned for a
-      // voice next to the device and can swallow a lecturer across the room; quiet sentences are normalised later
-      stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      stream = await navigator.mediaDevices.getUserMedia(micConstraints());
     }
-  } catch (e) { ctx.close().catch(() => {}); throw e; }
+  } catch (e) { if (ctx) ctx.close().catch(() => {}); throw e; }
   try {
-    await ctx.audioWorklet.addModule('pcm-worklet.js');
+    if (!ctx || (mode !== 'worklet' && !warm)) {     // the late ways: a fresh context now that capture runs
+      if (ctx) ctx.close().catch(() => {});
+      ctx = makeContext();
+    }
+    if (ctx.state !== 'running') await ctx.resume().catch(() => {});
     const src = ctx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
-    const node = new AudioWorkletNode(ctx, 'pcm-capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
     const mute = ctx.createGain();
     mute.gain.value = 0;
+    let node;
+    if (mode === 'script') {
+      node = ctx.createScriptProcessor(4096, 1, 1);
+      const feed = makeDecimator(ctx.sampleRate, onPcm);
+      node.onaudioprocess = (ev) => feed(ev.inputBuffer.getChannelData(0));
+    } else {
+      await ctx.audioWorklet.addModule('pcm-worklet.js');
+      node = new AudioWorkletNode(ctx, 'pcm-capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+      node.port.onmessage = (ev) => onPcm(new Int16Array(ev.data.pcm), ev.data.rms);
+    }
     src.connect(node);
     node.connect(mute).connect(ctx.destination);
-    node.port.onmessage = (ev) => onPcm(new Int16Array(ev.data.pcm), ev.data.rms);
     if (ctx.state !== 'running') await ctx.resume().catch(() => {});
-    return { ctx, stream, track: stream.getAudioTracks()[0], src, node, source };
+    return { ctx, stream, track: stream.getAudioTracks()[0], src, node, source, mode };
   } catch (e) {
     stream.getTracks().forEach((t) => t.stop());
-    ctx.close().catch(() => {});
+    if (ctx) ctx.close().catch(() => {});
     throw e;
   }
 }
+function captureOrder(source) {
+  const modes = window.AudioWorkletNode ? CAPTURE_MODES : ['script'];
+  if (source === 'system' || !PLATFORM.ios) return [modes[0]];
+  const known = store.get('capMode', '');
+  return modes.includes(known) ? [known, ...modes.filter((m) => m !== known)] : modes.slice();
+}
+// iPad: for the first 2.5 s of a class, check that sound really arrives (computers keep the stall check)
+const newCapCheck = (modes) => (PLATFORM.ios ? { modes, i: 0, t0: performance.now(), chunks: 0, peak: 0 } : null);
+// A way works when audio flows (10 pieces of 100 ms) and is not digital zero; any real microphone,
+// even in a quiet room, hears more than -120 dB. Otherwise the next way is tried.
+function checkCapture() {
+  const k = S.capCheck;
+  if (performance.now() - k.t0 < 2500) return;
+  const flowing = k.chunks >= 10;
+  if (flowing && k.peak >= 1e-6) {
+    store.set('capMode', k.modes[k.i]);
+    S.capCheck = null;
+    return;
+  }
+  if (k.i + 1 < k.modes.length) {
+    k.i += 1;
+    k.t0 = performance.now();
+    k.chunks = 0;
+    k.peak = 0;
+    switchCapture(k.modes[k.i]);
+    return;
+  }
+  S.capCheck = null;                                       // every way tried: tell the user
+  if (!flowing) {
+    if (!S.pause) pauseBegin('stalled');
+    S.pauseBanner = true;
+    banner('没有收到麦克风的声音。点「继续录音」再试一次；还不行，请停止录音，到“设置 → 麦克风检查”看结果，并把结果截图发给开发者。',
+      'error', { label: '继续录音', fn: resumeCapture });
+  } else {
+    banner('麦克风传来的一直是静音。请确认没有别的 App（通话、录音、视频会议）在用麦克风、没有连着蓝牙耳机；还不行，请停止录音，到“设置 → 麦克风检查”看结果，并把结果截图发给开发者。', 'error');
+  }
+}
+async function switchCapture(mode) {
+  const old = S.cap;
+  if (!S.run || !old) return;
+  let nc = null;
+  const feed = (pcm, rms) => { if (S.cap === nc) onClassPcm(pcm, rms); };   // nothing from it before the swap
+  try { nc = await openCapture(null, feed, old.source, mode); } catch (e) { banner(captureError(e, old.source), 'error'); return; }
+  if (S.cap !== old || !S.run) { closeCapture(nc); return; }
+  closeCapture(old);
+  S.cap = nc;
+  bindCaptureEvents(nc);
+  if (S.pause) S.pause.ctx0 = nc.ctx.currentTime;          // the pause ends on its first audio, measured on the new clock
+  else {
+    const dead = (performance.now() - S.run.lastChunk) / 1000;   // the class clock keeps up with time that had no audio
+    if (dead > 1) S.run.lost += dead;
+  }
+  S.run.lastChunk = performance.now();
+}
+// settings → 麦克风检查: each way for 2 seconds, with what the device reports (for a screenshot to the developer)
+async function micCheck() {
+  const out = $('#mic-result');
+  if (S.run || S.starting) { toast('先停止录音，再做麦克风检查'); return; }
+  out.classList.remove('hidden');
+  out.textContent = '正在检查（约 7 秒）：请对着设备说话…';
+  const ua = (navigator.userAgent.match(/(OS \d+[_\d]*|Version\/[\d.]+|Chrome\/\d+|Edg\/\d+)/g) || []).join(' ');
+  const lines = [`${PLATFORM.ios ? 'iPad/iPhone' : PLATFORM.mac ? 'Mac' : 'Windows/其他'} · ${PLATFORM.safari ? 'Safari' : '其他浏览器'} · ${ua}`];
+  let first = null;
+  try { first = makeContext(); first.resume().catch(() => {}); } catch { /* the late ways still run */ }   // made in the tap
+  let found = '';
+  for (const mode of CAPTURE_MODES) {
+    let chunks = 0, peak = 0;
+    try {
+      const cap = await openCapture(mode === 'worklet' ? first : null, (pcm, rms) => { chunks++; peak = Math.max(peak, rms); }, 'mic', mode);
+      first = null;
+      const st = cap.track && cap.track.getSettings ? cap.track.getSettings() : {};
+      await sleep(2000);
+      const ok = chunks >= 10 && peak >= 1e-6;
+      const level = peak >= 1e-6 ? `${Math.round(20 * Math.log10(peak))} dB` : '0（完全无声）';
+      lines.push(`${ok ? '✓' : '✗'} ${mode}：收到 ${chunks} 块，最大音量 ${level}，音频 ${cap.ctx.state}，${cap.ctx.sampleRate} Hz，`
+        + `回声消除 ${st.echoCancellation}，自动增益 ${st.autoGainControl}，降噪 ${st.noiseSuppression}，麦克风 ${cap.track.readyState}${cap.track.muted ? '（被占用）' : ''}`);
+      if (ok && !found) { found = mode; if (PLATFORM.ios) store.set('capMode', mode); }
+      closeCapture(cap);
+    } catch (e) {
+      lines.push(`✗ ${mode}：没打开（${e.name || ''} ${errText(e)}）`);
+    }
+    if (first) { first.close().catch(() => {}); first = null; }
+    out.textContent = lines.join('\n') + '\n…';
+  }
+  lines.push(!found ? '结论：都没收到声音。请把这段结果截图发给开发者。'
+    : PLATFORM.ios ? `结论：麦克风正常，之后录音先用 ${found}。` : '结论：麦克风正常。');
+  out.textContent = lines.join('\n');
+}
 function closeCapture(c) {
   if (!c) return;
-  c.node.port.onmessage = null;
+  if (c.node.port) c.node.port.onmessage = null;
+  c.node.onaudioprocess = null;
   c.ctx.onstatechange = null;
   if (c.track) { c.track.onmute = null; c.track.onunmute = null; c.track.onended = null; }
   try { c.src.disconnect(); c.node.disconnect(); } catch { /* already gone */ }
@@ -837,12 +968,20 @@ function concatChunks(chunks) {
   for (const c of chunks) { out.set(c.pcm, o); o += c.pcm.length; }
   return out;
 }
-/* Energy-based voice detection on 100 ms chunks with an adaptive noise floor. A sentence starts after
-   200 ms above the floor (with 300 ms of lead-in), ends after a pause (0.7 s by default; 0.3 s once
-   it is longer than 8 s) and is cut at its quietest point by 15 s. Under 0.3 s of voice is dropped. */
+/* Energy-based voice detection on 100 ms chunks with an adaptive noise floor. A piece starts after
+   200 ms above the floor (with 300 ms of lead-in) and ends after a pause (0.4 s at the fast pace). A
+   lecturer who talks on without pausing is cut early: past half the longest length a 0.2 s pause is
+   enough, and at the longest length (5 s fast) the piece is cut at its quietest point, so captions keep
+   coming. Under 0.3 s of voice is dropped. */
+const PACES = {
+  fast: { silenceMs: 400, maxSec: 5 },          // captions soonest; long sentences come in two or three pieces
+  balanced: { silenceMs: 550, maxSec: 8 },
+  complete: { silenceMs: 800, maxSec: 12 },     // fewer, more complete sentences, a few seconds later
+};
+const paceOf = (set = S.set) => PACES[set.pace] || PACES.fast;
 class Segmenter {
-  constructor({ silenceMs = 700, onSegment }) {
-    this.silenceN = Math.max(3, Math.round(silenceMs / 100));
+  constructor({ silenceMs = 400, maxSec = 5, onSegment }) {
+    this.setPace({ silenceMs, maxSec });
     this.onSegment = onSegment;
     this.noise = null;
     this.pre = [];
@@ -851,6 +990,11 @@ class Segmenter {
     this.voiced = 0;
     this.silence = 0;
     this.t0 = 0;
+  }
+  setPace({ silenceMs, maxSec }) {
+    this.silenceN = Math.max(3, Math.round(silenceMs / 100));
+    this.maxN = Math.max(20, Math.round(maxSec * 10));
+    this.softN = Math.round(this.maxN / 2);
   }
   get inSpeech() { return !!this.buf; }
   levels() { const n = this.noise === null ? 0.003 : this.noise; return { on: Math.max(0.004, n * 2.5), off: Math.max(0.0025, n * 1.7) }; }
@@ -878,8 +1022,8 @@ class Segmenter {
     }
     this.buf.push({ pcm, rms });
     if (rms > off) { this.voiced++; this.silence = 0; } else { this.silence++; if (rms < this.noise * 1.5) this.track(rms); }
-    if (this.silence >= (this.buf.length >= 80 ? 3 : this.silenceN)) { this.emit(tEnd, this.silence); return; }
-    if (this.buf.length >= 150) this.cut(tEnd);
+    if (this.silence >= (this.buf.length >= this.softN ? 2 : this.silenceN)) { this.emit(tEnd, this.silence); return; }
+    if (this.buf.length >= this.maxN) this.cut(tEnd);
   }
   emit(tEnd, trailing) {
     const drop = Math.max(0, trailing - 2);                     // keep 200 ms of the pause
@@ -892,8 +1036,8 @@ class Segmenter {
     if (voiced >= 3 && chunks.length) this.onSegment({ pcm: concatChunks(chunks), t0, t1, voicedSec: voiced / 10, trailingMs: trailing * 100 });
   }
   cut(tEnd) {
-    let best = 80, low = Infinity;
-    for (let i = 80; i < this.buf.length - 1; i++) if (this.buf[i].rms < low) { low = this.buf[i].rms; best = i; }
+    let best = this.softN, low = Infinity;
+    for (let i = this.softN; i < this.buf.length - 1; i++) if (this.buf[i].rms < low) { low = this.buf[i].rms; best = i; }
     const head = this.buf.slice(0, best + 1), tail = this.buf.slice(best + 1);
     const { off } = this.levels();
     const t0 = this.t0, t1 = tEnd - tail.length * 0.1;
@@ -1027,6 +1171,7 @@ function onClassPcm(pcm, rms) {
   const R = S.run;
   if (!R) return;
   R.lastChunk = performance.now();
+  if (S.capCheck) { S.capCheck.chunks++; S.capCheck.peak = Math.max(S.capCheck.peak, rms); }
   if (S.pause) maybeEndPause();
   const t = clockNow();                           // where this piece of audio starts on the class clock
   R.samples += pcm.length;
@@ -1070,16 +1215,27 @@ async function resumeCapture() {
   const P = S.pause;
   if (!P || !S.run) { hideBanner(); return; }
   const c = S.cap;
-  if (c && c.track && c.track.readyState !== 'ended' && c.ctx.state !== 'closed') {
-    try { await c.ctx.resume(); } catch { /* try a new microphone below */ }
-    if (c.ctx.state === 'running' && !c.track.muted) { maybeEndPause(); if (!S.pause) return; }
+  let ctx = null;
+  try { ctx = makeContext(); ctx.resume().catch(() => {}); } catch { /* made after the microphone instead */ }   // inside the tap
+  const live = !!(c && c.track && c.track.readyState === 'live' && c.ctx.state !== 'closed');
+  if (live) {
+    const before = S.run.lastChunk;
+    try { if (c.ctx.state === 'running') await c.ctx.suspend(); await c.ctx.resume(); } catch { /* try a new microphone below */ }
+    if (c.ctx.state === 'running' && !c.track.muted) {
+      await sleep(700);                                     // audio flowing again ends the pause by itself
+      if (!S.run || !S.pause || S.run.lastChunk > before) { if (ctx) ctx.close().catch(() => {}); maybeEndPause(); return; }
+    }
   }
-  const ctx = makeContext();
+  if (!S.run || S.cap !== c) { if (ctx) ctx.close().catch(() => {}); return; }
   let nc;
   const source = c ? c.source : (S.set.source || 'mic');
-  try { nc = await openCapture(ctx, onClassPcm, source); } catch (e) { banner(captureError(e, source), 'error', { label: '再试一次', fn: resumeCapture }); return; }
-  const wall = (performance.now() - P.wall0) / 1000;
-  const kept = c ? Math.max(0, c.ctx.currentTime - P.ctx0) : 0;
+  const mode = (c && c.mode) || captureOrder(source)[0];
+  try { nc = await openCapture(ctx, onClassPcm, source, mode, live); } catch (e) { banner(captureError(e, source), 'error', { label: '再试一次', fn: resumeCapture }); return; }
+  if (!S.run || S.cap !== c) { closeCapture(nc); return; }
+  const Q = S.pause || P;
+  const wall = (performance.now() - Q.wall0) / 1000;
+  // audio the old microphone still delivered during the pause (none when it had stalled)
+  const kept = c && Q.reason !== 'stalled' ? Math.max(0, c.ctx.currentTime - Q.ctx0) : 0;
   closeCapture(c);
   S.cap = nc;
   bindCaptureEvents(nc);
@@ -1087,7 +1243,8 @@ async function resumeCapture() {
   const lost = Math.max(0, wall - kept);
   S.run.lost += lost;
   S.run.lastChunk = performance.now();
-  if (lost >= 1.5) addGap(S.run.rec, P.clock0, P.clock0 + lost, P.reason);
+  S.capCheck = source === 'mic' ? newCapCheck([mode]) : null;   // iPad: is sound arriving this time?
+  if (lost >= 1.5) addGap(S.run.rec, Q.clock0, Q.clock0 + lost, Q.reason);
   hideBanner();
   setRunUI('recording');
 }
@@ -1424,19 +1581,20 @@ async function restoreLatest() {
 async function start(fresh = false) {
   if (S.run || S.starting || S.stopping) return;
   if (!sttReady()) { toast('先在设置里设置好语音识别服务（密钥）'); openSettings(); return; }
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.AudioWorkletNode) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     banner('这个浏览器不能在网页里录音。请用最新的 Safari、Chrome 或 Edge 打开（需要 https 地址）。', 'error');
     return;
   }
   let ctx;
-  try { ctx = makeContext(); } catch (e) { banner(`无法使用音频：${errText(e)}`, 'error'); return; }   // first, inside the tap
+  try { ctx = makeContext(); ctx.resume().catch(() => {}); } catch (e) { banner(`无法使用音频：${errText(e)}`, 'error'); return; }   // first, inside the tap
   if (S.dict) finishVoice(true);
   S.starting = true;
   setRunUI('starting');
   hideBanner();
   let cap;
   const source = CAN_SYSTEM_AUDIO && S.set.source === 'system' ? 'system' : 'mic';
-  try { cap = await openCapture(ctx, onClassPcm, source); } catch (e) {
+  const modes = captureOrder(source);
+  try { cap = await openCapture(ctx, onClassPcm, source, modes[0]); } catch (e) {
     S.starting = false;
     setRunUI('idle');
     banner(captureError(e, source), 'error');
@@ -1453,8 +1611,9 @@ async function start(fresh = false) {
   if (!llmReady()) banner('翻译服务还没设置好（密钥或模型），现在只显示识别出的原文。到“设置”里补上后，可以在句子上点“重试翻译”。', 'warn', { label: '打开设置', fn: openSettings });
   S.cap = cap;
   bindCaptureEvents(cap);
+  S.capCheck = source === 'mic' ? newCapCheck(modes) : null;
   S.run = { rec, base: rec.clock || 0, samples: 0, lost: 0, lastChunk: performance.now() };
-  S.seg = new Segmenter({ silenceMs: S.set.silenceMs, onSegment: (s) => onSegment(rec, s) });
+  S.seg = new Segmenter({ ...paceOf(), onSegment: (s) => onSegment(rec, s) });
   S.starting = false;
   setRunUI('recording');
   if (cap.ctx.state !== 'running') { pauseBegin('interrupted'); showPauseBanner(); }
@@ -1497,6 +1656,7 @@ async function stop() {
   S.run = null;
   S.seg = null;
   S.pause = null;
+  S.capCheck = null;
   if (S.pauseBanner) hideBanner();
   S.stopping = true;
   setRunUI('stopping');
@@ -1525,7 +1685,7 @@ function newRecording() {
   switchRecord(rec);
   S.run = { rec, base: 0, samples: 0, lost: 0, lastChunk: performance.now() };
   if (S.pause) { S.pause.clock0 = 0; S.pause.wall0 = performance.now(); S.pause.ctx0 = S.cap.ctx.currentTime; }
-  S.seg = new Segmenter({ silenceMs: S.set.silenceMs, onSegment: (s) => onSegment(rec, s) });
+  S.seg = new Segmenter({ ...paceOf(), onSegment: (s) => onSegment(rec, s) });
   finalize(old);
   saveRecord(rec);
   setRunUI(S.pause ? 'paused' : 'recording');
@@ -1571,7 +1731,8 @@ async function keepAwake(on) {
 }
 function tick() {
   if (S.run || S.mode === 'idle') $('#timer').textContent = mmss(clockNow());
-  if (S.run && !S.pause && performance.now() - S.run.lastChunk > 2500) pauseBegin('stalled');
+  if (S.capCheck && S.run) checkCapture();
+  else if (S.run && !S.pause && performance.now() - S.run.lastChunk > 2500) pauseBegin('stalled');
   if (S.pause && !S.pauseBanner && performance.now() - S.pause.wall0 > 2500) showPauseBanner();
   if (S.run && !S.pause && performance.now() - S.lastAutoSum > 10000) { S.lastAutoSum = performance.now(); maybeSummary(S.run.rec); }
 }
@@ -2248,7 +2409,7 @@ function openSettings() {
   f.noAI.checked = !!s.noAI;
   f.saveAudio.checked = s.saveAudio !== false;
   f.source.value = s.source === 'system' && CAN_SYSTEM_AUDIO ? 'system' : 'mic';
-  f.silenceMs.value = String(s.silenceMs);
+  f.pace.value = PACES[s.pace] ? s.pace : 'fast';
   refreshServiceForm();
   $('#test-result').textContent = '';
   $('#test-result').className = 'small';
@@ -2305,7 +2466,7 @@ function formSettings() {
     llmBase: f.llmBase.value.trim(), trModel: f.trModel.value.trim(), qaModel: f.qaModel.value.trim(),
     sttBase: f.sttBase.value.trim(), sttModel: sp === 'volc' ? '' : f.sttModel.value.trim(),
     direction: f.direction.value, course: f.course.value.trim(), glossary: f.glossary.value.trim(), noAI: f.noAI.checked,
-    saveAudio: f.saveAudio.checked, source: CAN_SYSTEM_AUDIO ? f.source.value : 'mic', silenceMs: Number(f.silenceMs.value) || DEFAULTS.silenceMs,
+    saveAudio: f.saveAudio.checked, source: CAN_SYSTEM_AUDIO ? f.source.value : 'mic', pace: f.pace.value,
   };
   for (const [url, what] of [[llmBase(next), '翻译服务'], [sttBase(next), '语音识别']]) {
     if (!url) return { error: `${what}是自定义服务，要填接口地址` };
@@ -2321,7 +2482,7 @@ function applySettings(next) {
   S.set = next;
   store.set('settings', S.set);
   if (keyChanged) S.keyBad = '';
-  if (S.seg) S.seg.silenceN = Math.max(3, Math.round(S.set.silenceMs / 100));
+  if (S.seg) S.seg.setPace(paceOf());
   updateHeader();
   updateKeyPill();
   updateNotice();
@@ -2601,6 +2762,7 @@ function bind() {
   });
   $('#btn-cancel').addEventListener('click', () => $('#dlg-settings').close());
   $('#btn-test').addEventListener('click', testConnection);
+  $('#btn-mic-check').addEventListener('click', micCheck);
   $('#btn-key-clear').addEventListener('click', () => {
     if (!confirm('从这台设备删除所有保存的密钥（各个服务的 API Key 和豆包语音的 Access Token）？')) return;
     applySettings({ ...S.set, keys: {}, volcAppId: '' });

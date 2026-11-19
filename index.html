@@ -14,7 +14,7 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="apple-touch-icon" href="icon-180.png">
   <link rel="icon" href="icon-192.png">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=1119m">
 </head>
 <body data-view="cap" class="ipad">
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
@@ -268,13 +268,17 @@
           </label>
           <div class="hint">选“电脑声音”时，开始录音后浏览器会问共享什么：选课程所在的<b>标签页</b>并打开“共享标签页音频”，或在 Windows 上选<b>整个屏幕</b>并打开“共享系统音频”。这时语音提问会用麦克风单独录，课堂转写不停。</div>
         </div>
+        <div class="row mic-check-row">
+          <button id="btn-mic-check" class="btn small" type="button">麦克风检查</button>
+          <span class="hint">收不到声音时点这里（要先停止录音），把结果截图发给开发者</span>
+        </div>
+        <pre id="mic-result" class="mic-result hidden"></pre>
         <label class="check"><input type="checkbox" name="saveAudio"> 保存课堂录音（存在这台设备上，约每小时 115 MB；可以在“以前的记录”里导出或删除）</label>
-        <label class="field col"><span>停顿多久算一句话结束</span>
-          <select name="silenceMs">
-            <option value="500">0.5 秒（最快，可能把一句切开）</option>
-            <option value="700">0.7 秒（默认）</option>
-            <option value="900">0.9 秒（说话慢、停顿多时）</option>
-            <option value="1200">1.2 秒</option>
+        <label class="field col"><span>出字幕的速度</span>
+          <select name="pace">
+            <option value="fast">快（默认）：最长约 5 秒出一段，长句会分两三段</option>
+            <option value="balanced">均衡：最长约 8 秒一段</option>
+            <option value="complete">句子完整：最长约 12 秒一段，字幕晚几秒</option>
           </select>
         </label>
       </fieldset>
@@ -300,6 +304,6 @@
     </form>
   </dialog>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=1119m"></script>
 </body>
 </html>

@@ -453,3 +453,7 @@ body.can-pip #btn-big { display: none; }
 body.big.can-pip #btn-big { display: inline-flex; }          /* in 大字幕 mode the way back stays in the top bar */
 body.big.can-pip #btn-pip { display: none; }
 .tip-home .btn { display: flex; width: fit-content; margin-top: 10px; }
+
+/* settings → 麦克风检查 */
+.mic-check-row { margin-top: 10px; }
+.mic-result { margin: 8px 0 0; padding: 10px 12px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line-soft); font: 12.5px/1.6 var(--font); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2); }
