@@ -8,7 +8,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="课堂翻译">
   <meta name="theme-color" content="#f1f1ee">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https: http://127.0.0.1:* http://localhost:*; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; object-src 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https: http://127.0.0.1:* http://localhost:*; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; object-src 'none'">
   <meta name="referrer" content="no-referrer">
   <title>课堂翻译</title>
   <link rel="manifest" href="manifest.webmanifest">
@@ -75,6 +75,7 @@
           <h2>课堂字幕</h2>
           <span id="dir-label" class="sub"></span>
           <span class="spacer"></span>
+          <button id="btn-player" class="btn small ghost hidden" type="button" aria-expanded="false" title="听这节课的录音">▶ 录音</button>
           <div class="popover-wrap">
             <button id="btn-display" class="btn small ghost" type="button" aria-expanded="false" aria-controls="display-pop">显示选项<svg class="i"><use href="#i-chev"/></svg></button>
             <div id="display-pop" class="popover hidden" role="group" aria-label="显示选项">
@@ -86,11 +87,15 @@
             </div>
           </div>
         </div>
+        <div id="player" class="player hidden">
+          <audio id="audio" controls preload="metadata" playsinline></audio>
+          <button id="btn-audio-export" class="btn small ghost" type="button">导出录音</button>
+        </div>
         <div class="captions-wrap">
           <div id="captions" class="captions scroll">
             <div id="empty" class="empty">
               <h3>点右上角「开始录音」</h3>
-              <p>第一次使用先点右上角 <b>设置</b> 填 OpenAI API Key（只存在这台 iPad 上）。录音时让这个页面留在前台，屏幕会保持常亮。</p>
+              <p>第一次使用先点右上角 <b>设置</b>，选翻译和语音识别用的服务（OpenAI、DeepSeek、豆包等），填它们的密钥（只存在这台 iPad 上）。录音时让这个页面留在前台，屏幕会保持常亮。</p>
               <p id="tip-home" class="tip-home">建议先在 Safari 点 <b>分享 → 添加到主屏幕</b>，以后从主屏幕图标打开：全屏显示，记录也不会被 Safari 自动清理。（从图标打开后需要重新填一次密钥。）</p>
               <p>想把字幕放在课件旁边：把这个页面拖成 <b>分屏</b> 或 <b>Slide Over</b>，再点 <b>大字幕</b>。</p>
             </div>
@@ -171,29 +176,71 @@
     <form id="settings-form" method="dialog">
       <h2>设置</h2>
       <fieldset>
-        <legend>OpenAI</legend>
-        <label class="field col"><span>API Key</span>
-          <input type="password" name="apiKey" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="sk-…">
+        <legend>翻译、总结和问答</legend>
+        <label class="field col"><span>服务</span>
+          <select name="llmProvider">
+            <option value="openai">OpenAI（GPT）</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="doubao">豆包（火山方舟）</option>
+            <option value="qwen">通义千问（阿里云百炼）</option>
+            <option value="kimi">Kimi（月之暗面）</option>
+            <option value="siliconflow">硅基流动</option>
+            <option value="custom">自定义（OpenAI 兼容接口）</option>
+          </select>
         </label>
-        <div class="key-row">
-          <span id="key-saved" class="hint"></span>
-          <button id="btn-key-clear" class="btn small ghost danger hidden" type="button">删除已保存的密钥</button>
-        </div>
-        <div class="hint">密钥只存在这台 iPad 的浏览器里，由 iPad 直接发给 OpenAI，不经过别的服务器。建议在 OpenAI 后台给这个密钥设一个用量上限。</div>
-        <div class="row">
-          <button id="btn-test" class="btn small" type="button">测试连接</button>
-          <span id="test-result" class="small"></span>
-        </div>
-        <details>
+        <label class="field col"><span id="llm-key-label">API Key</span>
+          <input type="password" name="llmKey" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="sk-…">
+        </label>
+        <div id="llm-key-saved" class="hint"></div>
+        <details id="llm-adv">
           <summary>模型和接口地址</summary>
-          <label class="field col"><span>语音识别模型（约 0.003 美元/分钟；gpt-4o-transcribe 更准，约贵一倍）</span><input name="sttModel" list="stt-models" spellcheck="false" autocapitalize="off"></label>
-          <label class="field col"><span>翻译和总结模型</span><input name="trModel" list="all-models" spellcheck="false" autocapitalize="off"></label>
-          <label class="field col"><span>问答模型</span><input name="qaModel" list="all-models" spellcheck="false" autocapitalize="off"></label>
-          <label class="field col"><span>接口地址</span><input name="baseUrl" spellcheck="false" autocapitalize="off"></label>
-          <datalist id="stt-models"><option value="gpt-4o-mini-transcribe"><option value="gpt-4o-transcribe"><option value="whisper-1"></datalist>
-          <datalist id="all-models"></datalist>
+          <label class="field col"><span>翻译和总结模型</span><input name="trModel" list="llm-models" spellcheck="false" autocapitalize="off"></label>
+          <label class="field col"><span>问答模型（可以聪明一点、慢一点）</span><input name="qaModel" list="llm-models" spellcheck="false" autocapitalize="off"></label>
+          <label class="field col"><span>接口地址</span><input name="llmBase" spellcheck="false" autocapitalize="off"></label>
+          <div id="llm-hint" class="hint"></div>
+          <datalist id="llm-models"></datalist>
         </details>
       </fieldset>
+      <fieldset>
+        <legend>语音识别</legend>
+        <label class="field col"><span>服务</span>
+          <select name="sttProvider">
+            <option value="openai">OpenAI</option>
+            <option value="groq">Groq（Whisper，最便宜）</option>
+            <option value="siliconflow">硅基流动（SenseVoice）</option>
+            <option value="volc">豆包语音（火山引擎）</option>
+            <option value="custom">自定义（OpenAI 兼容接口）</option>
+          </select>
+        </label>
+        <div id="stt-key-box">
+          <label class="field col"><span>API Key</span>
+            <input type="password" name="sttKey" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="sk-…">
+          </label>
+          <div id="stt-key-saved" class="hint"></div>
+        </div>
+        <div id="stt-same" class="hint hidden"></div>
+        <div id="volc-box" class="hidden">
+          <label class="field col"><span>APP ID</span><input name="volcAppId" autocomplete="off" spellcheck="false" autocapitalize="off" inputmode="numeric"></label>
+          <label class="field col"><span>Access Token</span><input type="password" name="volcToken" autocomplete="off" spellcheck="false" autocapitalize="off"></label>
+          <div id="volc-saved" class="hint"></div>
+          <div class="hint">在火山引擎“豆包语音”控制台（旧版控制台）的应用里复制 APP ID 和 Access Token，并开通“录音文件识别极速版”。新版控制台的单个 API Key 在网页里用不了。</div>
+        </div>
+        <div id="stt-price" class="hint"></div>
+        <details id="stt-adv">
+          <summary>模型和接口地址</summary>
+          <label class="field col"><span>语音识别模型</span><input name="sttModel" list="stt-models" spellcheck="false" autocapitalize="off"></label>
+          <label class="field col"><span>接口地址</span><input name="sttBase" spellcheck="false" autocapitalize="off"></label>
+          <datalist id="stt-models"></datalist>
+        </details>
+      </fieldset>
+      <div class="row">
+        <button id="btn-test" class="btn small" type="button">测试连接</button>
+        <span id="test-result" class="small"></span>
+      </div>
+      <div class="key-row">
+        <span class="hint">密钥只存在这台 iPad 的浏览器里，由 iPad 直接发给对应的服务，不经过别的服务器。建议在服务商后台给密钥设一个用量上限。</span>
+        <button id="btn-key-clear" class="btn small ghost danger" type="button">删除所有保存的密钥</button>
+      </div>
       <fieldset>
         <legend>这节课</legend>
         <label class="field col"><span>方向</span>
@@ -206,6 +253,7 @@
         <label class="field col"><span>课程名称（会用来帮助识别和翻译）</span><input name="course" maxlength="80" placeholder="例如：Interaction Design — Week 8"></label>
         <label class="field col"><span>术语表（每行“English = 中文”）</span><textarea name="glossary" rows="4" placeholder="usability testing = 可用性测试"></textarea></label>
         <label class="check"><input type="checkbox" name="noAI"> 这门课的作业不允许使用 AI（问答只解释概念，不写作业内容）</label>
+        <label class="check"><input type="checkbox" name="saveAudio"> 保存课堂录音（存在这台 iPad 上，约每小时 115 MB；可以在“以前的记录”里导出或删除）</label>
         <label class="field col"><span>停顿多久算一句话结束</span>
           <select name="silenceMs">
             <option value="500">0.5 秒（最快，可能把一句切开）</option>

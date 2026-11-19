@@ -22,10 +22,44 @@ const sstore = {
   set(k, v) { try { sessionStorage.setItem('rti.' + k, JSON.stringify(v)); } catch { /* storage unavailable */ } },
 };
 
+/* Model services for translation, summary and Q&A. All speak the OpenAI chat format from the browser
+   (CORS checked 2026-11-19; 智谱 GLM does not allow web pages, so it is PC-only). They differ in how
+   "thinking" is switched off (captions need the fast answer) and in names. `tr`/`qa` empty = picked from
+   the account's model list at “测试连接” (`prefer`: exact names or "re:" patterns, newest first). */
+const LLM_SERVICES = {
+  openai: { label: 'OpenAI', base: 'https://api.openai.com/v1', tr: 'gpt-4o-mini', qa: 'gpt-5.4-mini', temperature: 0.2,
+    prefer: ['gpt-4o-mini', 'gpt-4.1-mini'], qaPrefer: ['gpt-5.4-mini', 'gpt-4.1-mini', 'gpt-4o-mini'] },
+  // api-docs.deepseek.com (2026-11): deepseek-flash; deepseek-chat was retired 2026-07-24; thinking is on by default
+  deepseek: { label: 'DeepSeek', base: 'https://api.deepseek.com', tr: 'deepseek-flash', qa: 'deepseek-flash', temperature: 1.0,
+    prefer: ['deepseek-flash', 'deepseek-v4-flash', 're:^deepseek-v\\d.*flash'], extra: { thinking: { type: 'disabled' } } },
+  doubao: { label: '豆包（火山方舟）', base: 'https://ark.cn-beijing.volces.com/api/v3', tr: '', qa: '', temperature: 0.3,
+    prefer: ['re:^doubao-seed-.*(flash|lite|mini)', 're:^doubao-seed', 're:^doubao'], extra: { thinking: { type: 'disabled' } },
+    hint: '在火山方舟控制台的“模型广场 / 在线推理”复制模型 ID（如 doubao-seed-…-lite-…）或推理接入点 ID（ep-…）。' },
+  qwen: { label: '通义千问（阿里云百炼）', base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', tr: 'qwen-flash', qa: 'qwen-plus',
+    temperature: 0.3, prefer: ['qwen-flash', 'qwen-plus', 'qwen-turbo'], extra: { enable_thinking: false } },
+  kimi: { label: 'Kimi（月之暗面）', base: 'https://api.moonshot.cn/v1', tr: '', qa: '', temperature: null,
+    prefer: ['re:^kimi-k[\\d.]+.*turbo', 're:^kimi-k[\\d.]+$', 're:^kimi'], hint: '非 thinking 的模型更快。' },
+  siliconflow: { label: '硅基流动', base: 'https://api.siliconflow.cn/v1', tr: '', qa: '', temperature: 0.3,
+    prefer: ['re:^deepseek-ai/deepseek-v[\\d.]+$', 're:^qwen/qwen[\\d.]+-.*instruct', 're:^qwen/'],
+    hint: '在硅基流动的模型广场复制完整模型名，如 deepseek-ai/DeepSeek-V…' },
+  custom: { label: '自定义（OpenAI 兼容）', base: '', tr: '', qa: '', temperature: 0.3, prefer: [] },
+};
+// Speech-to-text services a web page can call. kind: "openai" (OpenAI format with language + prompt),
+// "basic" (OpenAI format, only file + model), "volc" (豆包语音 录音文件识别极速版, its own format).
+const STT_SERVICES = {
+  openai: { label: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-4o-mini-transcribe', kind: 'openai',
+    models: ['gpt-4o-mini-transcribe', 'gpt-4o-transcribe', 'whisper-1'], price: 'gpt-4o-mini-transcribe 约 0.003 美元/分钟，gpt-4o-transcribe 约贵一倍' },
+  groq: { label: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'whisper-large-v3-turbo', kind: 'openai',
+    models: ['whisper-large-v3-turbo', 'whisper-large-v3'], price: 'whisper-large-v3-turbo 约 0.04 美元/小时（每句至少按 10 秒计）' },
+  siliconflow: { label: '硅基流动', base: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/SenseVoiceSmall', kind: 'basic',
+    models: ['FunAudioLLM/SenseVoiceSmall', 'TeleAI/TeleSpeechASR'], price: '以硅基流动官网为准' },
+  volc: { label: '豆包语音（火山引擎）', base: 'https://openspeech.bytedance.com', model: '', kind: 'volc', models: [], price: '以火山引擎官网为准' },
+  custom: { label: '自定义（OpenAI 兼容）', base: '', model: '', kind: 'openai', models: [] },
+};
 const DEFAULTS = {
-  apiKey: '', baseUrl: 'https://api.openai.com/v1',
-  sttModel: 'gpt-4o-mini-transcribe', trModel: 'gpt-4o-mini', qaModel: 'gpt-5.4-mini',
-  direction: 'en2zh', course: '', glossary: '', noAI: false, silenceMs: 700, autoSum: true,
+  llmProvider: 'openai', sttProvider: 'openai', keys: {}, volcAppId: '',
+  llmBase: '', trModel: '', qaModel: '', sttBase: '', sttModel: '',      // empty = the service's default
+  direction: 'en2zh', course: '', glossary: '', noAI: false, silenceMs: 700, autoSum: true, saveAudio: true,
 };
 const DIRECTION_LABEL = { en2zh: '英 → 中', zh2en: '中 → 英', auto: '中英自动互译' };
 const GAP_REASON = {
@@ -97,21 +131,52 @@ function announce(text) { const el = $('#sr-live'); el.textContent = ''; setTime
 
 // ------------------------------------------------------------------ settings
 function loadSettings() {
-  const s = { ...DEFAULTS, ...store.get('settings', {}) };
+  const raw = store.get('settings', {});
+  const s = { ...DEFAULTS, ...raw, keys: { ...(raw.keys || {}) } };
+  // the first iPad version had one OpenAI key and one address for everything
+  if (raw.apiKey && !s.keys.openai) s.keys.openai = raw.apiKey;
+  if (raw.baseUrl && raw.baseUrl !== 'https://api.openai.com/v1') { s.llmBase = s.llmBase || raw.baseUrl; s.sttBase = s.sttBase || raw.baseUrl; }
+  for (const [k, def] of [['sttModel', 'gpt-4o-mini-transcribe'], ['trModel', 'gpt-4o-mini'], ['qaModel', 'gpt-5.4-mini']]) if (raw.apiKey && s[k] === def) s[k] = '';
+  delete s.apiKey;
+  delete s.baseUrl;
+  if (!LLM_SERVICES[s.llmProvider]) s.llmProvider = 'openai';
+  if (!STT_SERVICES[s.sttProvider]) s.sttProvider = 'openai';
   s.silenceMs = Number(s.silenceMs) || DEFAULTS.silenceMs;
   return s;
 }
-function apiBase(set = S.set) { return (set.baseUrl || DEFAULTS.baseUrl).trim().replace(/\/+$/, ''); }
+const llmSvc = (set = S.set) => LLM_SERVICES[set.llmProvider] || LLM_SERVICES.openai;
+const sttSvc = (set = S.set) => STT_SERVICES[set.sttProvider] || STT_SERVICES.openai;
+const trimUrl = (u) => String(u || '').trim().replace(/\/+$/, '');
+const keyId = (kind, provider) => (provider === 'custom' ? (kind === 'stt' ? 'customStt' : 'custom') : provider);
+function llmBase(set = S.set) { return trimUrl(set.llmBase || llmSvc(set).base); }
+function sttBase(set = S.set) { return trimUrl(set.sttBase || sttSvc(set).base); }
+function llmKey(set = S.set) { return set.keys[keyId('llm', set.llmProvider)] || ''; }
+function sttKey(set = S.set) { return set.sttProvider === 'volc' ? (set.keys.volcToken || '') : (set.keys[keyId('stt', set.sttProvider)] || ''); }
+function trModel(set = S.set) { return set.trModel || llmSvc(set).tr || ''; }
+function qaModel(set = S.set) { return set.qaModel || llmSvc(set).qa || trModel(set); }
+function sttModel(set = S.set) { return set.sttModel || sttSvc(set).model || ''; }
+function llmReady(set = S.set) { return !!(llmKey(set) && llmBase(set) && trModel(set)); }
+function sttReady(set = S.set) {
+  return set.sttProvider === 'volc' ? !!(set.volcAppId && set.keys.volcToken && sttBase(set)) : !!(sttKey(set) && sttBase(set) && sttModel(set));
+}
 function checkBase(url) {
   let u;
-  try { u = new URL(url); } catch { return '接口地址格式不对，例如 https://api.openai.com/v1'; }
+  try { u = new URL(url); } catch { return '接口地址格式不对，例如 https://api.example.com/v1'; }
   if (u.protocol === 'https:') return '';
   if (u.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname)) return '';   // local test servers
   return '接口地址必须以 https:// 开头，密钥才不会被别人看到';
 }
-function apiHost(set = S.set) { try { return new URL(apiBase(set)).host; } catch { return ''; } }
-// OpenAI's own request format (max_completion_tokens, reasoning_effort); local test servers get it too
-function openaiStyle() { try { const h = new URL(apiBase()).hostname; return h === 'api.openai.com' || h === '127.0.0.1' || h === 'localhost'; } catch { return false; } }
+function hostOf(url) { try { return new URL(url).host; } catch { return ''; } }
+function pickModel(prefer, ids) {
+  for (const p of prefer || []) {
+    if (p.startsWith('re:')) {
+      const rx = new RegExp(p.slice(3), 'i');
+      const hits = ids.filter((m) => rx.test(m)).sort().reverse();       // newest version first
+      if (hits.length) return hits[0];
+    } else if (ids.includes(p)) return p;
+  }
+  return '';
+}
 
 // ------------------------------------------------------------------ API calls
 class ApiError extends Error {
@@ -163,10 +228,13 @@ function reasoningEffortFor(model) {
 
 /* Streams a chat completion. Only a stream that ended properly counts as complete; partial text is
    never "done": kind "truncated" (length limit), "incomplete" (cut off), "empty", "aborted" (stopped). */
-async function chatStream({ model, messages, maxTokens = 600, temperature = 0.2, effort = null, signal = null, onDelta = null, timeoutMs = 60000 }) {
+// The request for the chosen service: OpenAI's own format (max_completion_tokens, reasoning_effort) or
+// the common one (max_tokens + the service's switches, e.g. thinking off).
+function chatPayload(model, messages, maxTokens, effort) {
+  const svc = llmSvc();
   const payload = { model, messages, stream: true };
-  const reasoning = openaiStyle() ? reasoningEffortFor(model) : null;
-  if (openaiStyle()) {
+  const reasoning = S.set.llmProvider === 'openai' ? reasoningEffortFor(model) : null;
+  if (S.set.llmProvider === 'openai') {
     payload.max_completion_tokens = maxTokens;
     const eff = reasoning && effort ? effort : reasoning;
     if (eff) {
@@ -175,18 +243,36 @@ async function chatStream({ model, messages, maxTokens = 600, temperature = 0.2,
     }
   } else {
     payload.max_tokens = maxTokens;
+    Object.assign(payload, JSON.parse(JSON.stringify(svc.extra || {})));
   }
-  if (temperature !== null && !reasoning) payload.temperature = temperature;     // reasoning models only take the default
-  const post = () => fetchT(apiBase() + '/chat/completions', {
+  if (svc.temperature !== null && svc.temperature !== undefined && !reasoning) payload.temperature = svc.temperature;
+  return payload;
+}
+// a 400 that names an optional parameter: drop it (or use max_tokens) and try again
+function relaxPayload(payload, body) {
+  const low = String(body).toLowerCase();
+  let changed = false;
+  for (const [key, word] of [['reasoning_effort', 'reasoning'], ['thinking', 'thinking'], ['enable_thinking', 'thinking'], ['temperature', 'temperature']]) {
+    if (key in payload && low.includes(word)) { delete payload[key]; changed = true; }
+  }
+  if ('max_completion_tokens' in payload && low.includes('max_completion_tokens')) {
+    payload.max_tokens = payload.max_completion_tokens;
+    delete payload.max_completion_tokens;
+    changed = true;
+  }
+  return changed;
+}
+async function chatStream({ model, messages, maxTokens = 600, effort = null, signal = null, onDelta = null, timeoutMs = 60000 }) {
+  const payload = chatPayload(model, messages, maxTokens, effort);
+  const post = () => fetchT(llmBase() + '/chat/completions', {
     method: 'POST', signal,
-    headers: { Authorization: `Bearer ${S.set.apiKey}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${llmKey()}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   }, timeoutMs);
   let r = await post();
-  if (r.status === 400 && payload.reasoning_effort) {
+  for (let i = 0; i < 3 && r.status === 400; i++) {
     const body = await r.text();
-    if (!/reasoning/i.test(body)) throw friendly(400, body);
-    delete payload.reasoning_effort;                 // this model does not take the parameter: retry without
+    if (!relaxPayload(payload, body)) throw friendly(400, body);
     r = await post();
   }
   if (!r.ok) throw friendly(r.status, await r.text());
@@ -356,11 +442,13 @@ const DB = {
   open() {
     return new Promise((resolve) => {
       let req;
-      try { req = indexedDB.open('classroom-translator', 1); } catch (e) { DB.failed = errText(e); resolve(null); return; }
+      try { req = indexedDB.open('classroom-translator', 2); } catch (e) { DB.failed = errText(e); resolve(null); return; }
       req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains('records')) db.createObjectStore('records', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('notes')) db.createObjectStore('notes', { keyPath: 'id', autoIncrement: true }).createIndex('recordId', 'recordId');
+        // the class recording: ~10 s pieces of 16 kHz PCM, each with its place on the class clock
+        if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'k' }).createIndex('recordId', 'recordId');
       };
       req.onsuccess = () => { DB.db = req.result; resolve(DB.db); };
       req.onerror = () => { DB.failed = errText(req.error); resolve(null); };
@@ -382,7 +470,121 @@ const DB = {
   put: (name, v) => DB.tx(name, 'readwrite', (os) => os.put(v)),
   all: (name) => DB.tx(name, 'readonly', (os) => os.getAll()),
   del: (name, k) => DB.tx(name, 'readwrite', (os) => os.delete(k)),
+  allOf: (name, recordId) => DB.tx(name, 'readonly', (os) => os.index('recordId').getAll(recordId)),
+  delOf: (name, recordId) => DB.tx(name, 'readwrite', (os) => {
+    const cur = os.index('recordId').openKeyCursor(IDBKeyRange.only(recordId));
+    cur.onsuccess = () => { const c = cur.result; if (c) { os.delete(c.primaryKey); c.continue(); } };
+    return null;
+  }),
 };
+
+// ------------------------------------------------------------------ class recording (on this iPad)
+/* The PCM that drives the class clock is kept in ~10 s pieces with their clock position. A question
+   asked on the same microphone is written as silence (private), time the system took the microphone
+   away is filled with silence on export, so minute 12:40 of the WAV is the caption marked 12:40. */
+const AUDIO_PIECE = SR * 10;
+let audioWrites = Promise.resolve();
+function recordAudio(rec, pcm, t, silent) {
+  if (S.set.saveAudio === false || !DB.db) return;
+  let b = S.audioBuf;
+  if (b && (b.rec !== rec || Math.abs(b.t0 + b.n / SR - t) > 0.05)) { flushAudio(); b = null; }
+  if (!b) b = S.audioBuf = { rec, t0: t, parts: [], n: 0 };
+  b.parts.push(silent ? new Int16Array(pcm.length) : pcm);
+  b.n += pcm.length;
+  if (b.n >= AUDIO_PIECE) flushAudio();
+}
+function flushAudio() {
+  const b = S.audioBuf;
+  S.audioBuf = null;
+  if (!b || !b.n) return audioWrites;
+  const rec = b.rec;
+  const seq = rec.audioSeq || 0;
+  rec.audioSeq = seq + 1;
+  const piece = { k: `${rec.id}|${String(seq).padStart(7, '0')}`, recordId: rec.id, seq, t0: round2(b.t0), n: b.n,
+    pcm: new Blob(b.parts, { type: 'application/octet-stream' }) };
+  audioWrites = audioWrites.then(() => DB.put('audio', piece)).then(() => {
+    rec.recChunks = (rec.recChunks || 0) + 1;
+    rec.recEnd = Math.max(rec.recEnd || 0, piece.t0 + piece.n / SR);
+    scheduleSave(rec);
+    if (rec === S.record && !S.run) renderPlayer();
+  }, (e) => {
+    toast(`录音没有存上：${errText(e)}`);
+  });
+  return audioWrites;
+}
+function wavHeader(samples) {
+  const buf = new ArrayBuffer(44);
+  const dv = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); dv.setUint32(4, 36 + samples * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true); dv.setUint32(24, SR, true);
+  dv.setUint32(28, SR * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true); str(36, 'data');
+  dv.setUint32(40, samples * 2, true);
+  return buf;
+}
+// one WAV for the whole record: pieces in order, silence where the class clock had no audio
+async function recordingBlob(rec) {
+  await flushAudio();
+  const pieces = (await DB.allOf('audio', rec.id)).sort((a, b) => a.seq - b.seq);
+  if (!pieces.length) return null;
+  const parts = [];
+  let pos = 0;
+  const silence = (n) => { while (n > 0) { const k = Math.min(n, SR * 60); parts.push(new Int16Array(k)); n -= k; } };
+  for (const p of pieces) {
+    const start = Math.round(p.t0 * SR);
+    if (start > pos) silence(Math.min(start - pos, SR * 3600 * 4));
+    parts.push(p.pcm);
+    pos = Math.max(pos, start) + p.n;
+  }
+  return new Blob([wavHeader(pos), ...parts], { type: 'audio/wav' });
+}
+function recordingName(rec) { return recordFileName(rec).replace(/\.md$/, '.wav'); }
+// after class: the player, and a caption's time plays the recording from that sentence
+function playable() { const r = S.record; return !!(r && r.recChunks && !S.run && !S.starting && !S.stopping); }
+async function renderPlayer() {
+  const ok = playable();
+  document.body.classList.toggle('has-audio', ok);
+  $('#btn-player').classList.toggle('hidden', !ok);
+  const a = $('#audio');
+  if (!ok) {
+    $('#player').classList.add('hidden');
+    $('#btn-player').setAttribute('aria-expanded', 'false');
+    if (!a.paused) a.pause();
+    return;
+  }
+  const rec = S.record;
+  const key = `${rec.id}|${rec.recChunks}|${rec.recEnd}`;
+  if (S.audioKey === key) return;
+  S.audioKey = key;
+  let blob = null;
+  try { blob = await recordingBlob(rec); } catch (e) { toast(`读不到录音：${errText(e)}`); }
+  if (S.audioKey !== key || !blob) return;
+  if (S.audioUrl) URL.revokeObjectURL(S.audioUrl);
+  S.audioUrl = URL.createObjectURL(blob);
+  S.audioBlob = blob;
+  a.src = S.audioUrl;
+}
+function togglePlayer(open) {
+  const p = $('#player');
+  const show = open === undefined ? p.classList.contains('hidden') : open;
+  p.classList.toggle('hidden', !show);
+  $('#btn-player').setAttribute('aria-expanded', String(show));
+}
+function playFrom(t) {
+  if (!playable()) return;
+  togglePlayer(true);
+  const a = $('#audio');
+  const at = Math.max(0, t - 0.3);
+  a.currentTime = at;
+  a.play().catch(() => toast('没有开始播放，点一下播放键'));        // inside the tap, so iPadOS allows it
+  if (a.readyState < 1) a.addEventListener('loadedmetadata', () => { if (Math.abs(a.currentTime - at) > 1) a.currentTime = at; }, { once: true });
+}
+async function exportRecording(rec) {
+  const blob = rec === S.record && S.audioBlob && S.audioKey === `${rec.id}|${rec.recChunks}|${rec.recEnd}` ? S.audioBlob : await recordingBlob(rec);
+  if (!blob) { toast('这份记录没有录音'); return; }
+  const how = await exportText(recordingName(rec), blob, ['audio/wav']);
+  if (how === 'downloaded') toast('录音已下载（在“文件 → 下载”里）');
+}
 
 // per-record runtime state (never stored)
 const RT = new WeakMap();
@@ -399,10 +601,13 @@ function newRecordObj() {
   const now = Date.now();
   return {
     id: uid('r'), v: 1, createdAt: now, updatedAt: now, course: S.set.course, direction: S.set.direction,
-    sttModel: S.set.sttModel, trModel: S.set.trModel, segs: [], gaps: [], nextId: 0, clock: 0, audioSec: 0,
+    sttModel: sttLabel(), trModel: llmLabel(), segs: [], gaps: [], nextId: 0, clock: 0, audioSec: 0,
     summary: '', sumUpto: -1, sumUptoLabel: '', open: false,
+    recEnd: 0, recChunks: 0, audioSeq: 0,          // the class recording (chunks in the "audio" store)
   };
 }
+const llmLabel = () => `${llmSvc().label} ${trModel()}`.trim();
+const sttLabel = () => `${sttSvc().label} ${sttModel()}`.trim();
 function hydrate(d) {
   const segs = (d.segs || []).map((s) => ({ ...s }));
   return { ...d, segs, gaps: (d.gaps || []).map((g) => ({ ...g })), nextId: d.nextId || segs.reduce((m, s) => Math.max(m, s.id + 1), 0) };
@@ -413,6 +618,7 @@ function storedRecord(rec) {
     sttModel: rec.sttModel, trModel: rec.trModel, nextId: rec.nextId,
     clock: S.run && S.run.rec === rec ? clockNow() : rec.clock, audioSec: rec.audioSec,
     summary: rec.summary, sumUpto: rec.sumUpto, sumUptoLabel: rec.sumUptoLabel, open: rec.open,
+    recEnd: rec.recEnd || 0, recChunks: rec.recChunks || 0, audioSeq: rec.audioSeq || 0,
     segs: rec.segs.filter((s) => s.src).map(({ id, t0, t1, src, tr, lang, tgt, state, err }) => ({ id, t0, t1, src, tr, lang, tgt, state, err: err || '' })),
     gaps: rec.gaps.map((g) => ({ ...g })),
   };
@@ -487,8 +693,10 @@ function buildMarkdown(rec) {
   const L = [`# 实时翻译记录 · ${fmtDate(rec.createdAt)}`, ''];
   if (rec.course) L.push(`- 课程：${rec.course}`);
   L.push(`- 方向：${DIRECTION_LABEL[rec.direction] || rec.direction}`, `- 记录编号：${rec.id}`,
-    `- 翻译：${rec.trModel || ''}；语音识别：OpenAI ${rec.sttModel || ''}（iPad 网页版）`,
-    '- 说明：自动识别与机器翻译，未经人工校对；私下的问答不在这份记录里', '');
+    `- 翻译：${rec.trModel || ''}；语音识别：${rec.sttModel || ''}（iPad 网页版）`,
+    '- 说明：自动识别与机器翻译，未经人工校对；私下的问答不在这份记录里');
+  if (rec.recChunks) L.push(`- 录音：在“以前的记录”里点“导出录音”（WAV，约 ${Math.round(rec.recEnd / 60)} 分钟；录音里的时间和下面每句前的时间一致）`);
+  L.push('');
   if (rec.summary) L.push('## 总结', '', rec.summary, '');
   L.push('## 逐句记录', '');
   const items = [...rec.segs.filter((s) => s.src).map((s) => [s.t0, 1, s]), ...rec.gaps.map((g) => [g.t0, 0, g])]
@@ -510,8 +718,8 @@ function recordFileName(rec) {
 }
 // Share sheet first (save to Files, AirDrop to the computer, send to yourself), download as fallback.
 // Called straight from a tap: Safari only opens the share sheet from a user action.
-async function exportText(name, text) {
-  for (const type of ['text/markdown', 'text/plain']) {
+async function exportText(name, text, types = ['text/markdown', 'text/plain']) {
+  for (const type of types) {
     let file;
     try { file = new File([text], name, { type }); } catch { break; }
     if (navigator.canShare && navigator.share && navigator.canShare({ files: [file] })) {
@@ -519,7 +727,7 @@ async function exportText(name, text) {
       break;
     }
   }
-  const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown;charset=utf-8' }));
+  const url = URL.createObjectURL(text instanceof Blob ? text : new Blob([text], { type: 'text/markdown;charset=utf-8' }));
   const a = document.createElement('a');
   a.href = url;
   a.download = name;
@@ -701,17 +909,53 @@ function sttPrompt() {
   if (terms.length) parts.push(terms.slice(0, 40).join(', '));
   return parts.join('. ').slice(0, 600);
 }
-async function transcribe(pcm, { language = '', prompt = '' } = {}) {
+async function transcribe(pcm, { language = '', prompt = '' } = {}, set = S.set) {
+  const svc = sttSvc(set);
+  if (svc.kind === 'volc') return transcribeVolc(pcm, set);
   const fd = new FormData();
   fd.append('file', wavBlob(pcm), 'speech.wav');
-  fd.append('model', S.set.sttModel);
-  fd.append('response_format', 'json');
-  if (language) fd.append('language', language);
-  if (prompt) fd.append('prompt', prompt);
-  const r = await fetchT(apiBase() + '/audio/transcriptions', { method: 'POST', headers: { Authorization: `Bearer ${S.set.apiKey}` }, body: fd }, 30000);
+  fd.append('model', sttModel(set));
+  if (svc.kind === 'openai') {
+    fd.append('response_format', 'json');
+    if (language) fd.append('language', language);
+    if (prompt) fd.append('prompt', prompt);
+  }
+  const r = await fetchT(sttBase(set) + '/audio/transcriptions', { method: 'POST', headers: { Authorization: `Bearer ${sttKey(set)}` }, body: fd }, 30000);
   if (!r.ok) throw friendly(r.status, await r.text());
   const j = await r.json();
-  return String(j.text || '').trim();
+  return String(j.text || '').replace(/<\|[^|>]*\|>/g, '').trim();      // SenseVoice can leave <|zh|>-style tags
+}
+async function blobBase64(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+// 豆包语音 录音文件识别极速版: one request per sentence. A web page can only send the old-console
+// APP ID + Access Token (the new single X-Api-Key header is not allowed from browsers).
+async function transcribeVolc(pcm, set = S.set) {
+  const rid = (crypto.randomUUID && crypto.randomUUID()) || uid('req');
+  const r = await fetchT(sttBase(set) + '/api/v3/auc/bigmodel/recognize/flash', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json', 'X-Api-App-Key': set.volcAppId, 'X-Api-Access-Key': set.keys.volcToken || '',
+      'X-Api-Resource-Id': 'volc.bigasr.auc_turbo', 'X-Api-Request-Id': rid, 'X-Api-Sequence': '-1',
+    },
+    body: JSON.stringify({ user: { uid: 'classroom-translator' }, audio: { data: await blobBase64(wavBlob(pcm)) },
+      request: { model_name: 'bigmodel', enable_itn: true, enable_punc: true } }),
+  }, 30000);
+  const code = r.headers.get('X-Api-Status-Code') || '';
+  const msg = r.headers.get('X-Api-Message') || '';
+  if (code === '20000003') return '';                                  // silence
+  if ((code && code !== '20000000') || !r.ok) {
+    if (r.status === 401 || r.status === 403 || code === '45000010' || /grant|auth|token|appkey/i.test(msg)) {
+      throw new ApiError('豆包语音的 APP ID 或 Access Token 不对，或者还没开通“录音文件识别极速版”（401）', { status: 401 });
+    }
+    if (code.startsWith('550') || r.status >= 500) throw new ApiError(`豆包语音服务暂时不可用（${code || r.status}）`, { status: 503, retryable: true });
+    throw new ApiError(`豆包语音识别失败（${code || r.status}${msg ? '：' + msg.slice(0, 80) : ''}）`, { status: r.status });
+  }
+  const j = await r.json();
+  return String((j.result && j.result.text) || '').trim();
 }
 // what speech-to-text models "hear" in silence or noise (same list as the PC version, asr.py)
 const HALLU = new Set(['thanksforwatching', 'thankyouforwatching', 'pleasesubscribe', 'likeandsubscribe',
@@ -752,9 +996,11 @@ function onClassPcm(pcm, rms) {
   if (!R) return;
   R.lastChunk = performance.now();
   if (S.pause) maybeEndPause();
+  const t = clockNow();                           // where this piece of audio starts on the class clock
   R.samples += pcm.length;
   showLevel(rms);
-  if (S.dict && S.dict.same) { dictPcm(S.dict, pcm, rms); return; }
+  if (S.dict && S.dict.same) { recordAudio(R.rec, pcm, t, true); dictPcm(S.dict, pcm, rms); return; }   // private: silence
+  recordAudio(R.rec, pcm, t, false);
   if (S.pause) return;
   S.seg.push(pcm, rms, clockNow());
   $('#live').classList.toggle('speaking', S.seg.inSpeech);
@@ -764,6 +1010,7 @@ function pauseBegin(reason) {
   if (S.seg) S.seg.flush(clockNow());
   S.pause = { reason, wall0: performance.now(), ctx0: S.cap.ctx.currentTime, clock0: clockNow() };
   setRunUI('paused');
+  flushAudio();
   saveRecord(S.run.rec);
 }
 // Back to recording. The audio clock (ctx.currentTime) shows whether audio was really lost: only
@@ -865,6 +1112,13 @@ function dropSeg(rec, seg) {
   if (!rec.segs.length && !rec.gaps.length) $('#empty').classList.remove('hidden');
 }
 async function translate(rec, seg) {
+  if (!llmReady()) {                       // captions still come; translation waits for the settings
+    seg.state = 'error';
+    seg.err = '翻译服务还没设置好（设置里补上密钥和模型后点“重试翻译”）';
+    if (rec === S.record) paintSeg(seg);
+    scheduleSave(rec);
+    return;
+  }
   const x = rt(rec);
   x.tr++;
   updateStats();
@@ -879,7 +1133,7 @@ async function translate(rec, seg) {
       let first = 0;
       try {
         await chatStream({
-          model: S.set.trModel, messages, maxTokens: 500, timeoutMs: 30000,
+          model: trModel(), messages, maxTokens: 500, timeoutMs: 30000,
           onDelta: (d) => {
             if (!first) first = performance.now();
             seg.tr += d;
@@ -920,7 +1174,7 @@ function retrySeg(id) {
   const rec = S.record;
   const seg = S.byId.get(id);
   if (!rec || !seg) return;
-  if (!S.set.apiKey) { openSettings(); return; }
+  if (!(seg.state === 'sttError' ? sttReady() : llmReady())) { toast('先在设置里把这项服务设置好'); openSettings(); return; }
   if (seg.state === 'sttError') {
     if (!seg._pcm) { toast('这一句的录音已经不在了，无法重新识别'); return; }
     seg.state = 'recognizing';
@@ -1133,7 +1387,7 @@ async function restoreLatest() {
 // ------------------------------------------------------------------ start / stop / 新录音
 async function start(fresh = false) {
   if (S.run || S.starting || S.stopping) return;
-  if (!S.set.apiKey) { toast('先在设置里填 OpenAI API Key'); openSettings(); return; }
+  if (!sttReady()) { toast('先在设置里设置好语音识别服务（密钥）'); openSettings(); return; }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.AudioWorkletNode) {
     banner('这个浏览器不能在网页里录音。请用 iPad 上最新的 Safari 打开（需要 https 地址）。', 'error');
     return;
@@ -1155,9 +1409,10 @@ async function start(fresh = false) {
   if (fresh || !rec) { rec = newRecordObj(); switchRecord(rec); }
   rec.open = true;
   rec.direction = S.set.direction;
-  rec.sttModel = S.set.sttModel;
-  rec.trModel = S.set.trModel;
+  rec.sttModel = sttLabel();
+  rec.trModel = llmLabel();
   if (!rec.course) rec.course = S.set.course;
+  if (!llmReady()) banner('翻译服务还没设置好（密钥或模型），现在只显示识别出的原文。到“设置”里补上后，可以在句子上点“重试翻译”。', 'warn', { label: '打开设置', fn: openSettings });
   S.cap = cap;
   bindCaptureEvents(cap);
   S.run = { rec, base: rec.clock || 0, samples: 0, lost: 0, lastChunk: performance.now() };
@@ -1186,6 +1441,7 @@ function waitIdle(rec, ms) {
 }
 // the record is finished: pending sentences finish into it, then a last summary and save
 async function finalize(rec) {
+  await flushAudio();
   saveRecord(rec);
   await waitIdle(rec, 30000);
   rec.open = false;
@@ -1225,6 +1481,7 @@ function newRecording() {
   const old = S.run.rec;
   if (S.seg && !S.pause) S.seg.flush(clockNow());
   old.clock = clockNow();
+  flushAudio();                                   // the old record's last piece of audio
   const rec = newRecordObj();
   rec.open = true;
   switchRecord(rec);
@@ -1258,6 +1515,7 @@ function setRunUI(mode) {
   }[mode];
   $('#lat-k').textContent = mode !== 'recording' && S.lat.length ? '最近延迟' : '延迟';
   $('#timer').textContent = mmss(clockNow());
+  renderPlayer();
 }
 async function keepAwake(on) {
   if (!on) { if (S.wake) S.wake.release().catch(() => {}); S.wake = null; return; }
@@ -1283,7 +1541,7 @@ function tick() {
 function maybeSummary(rec, force = false) {
   if (!rec) return false;
   const x = rt(rec);
-  if (x.sumBusy || !S.set.apiKey) return false;
+  if (x.sumBusy || !llmReady()) return false;
   const fresh = rec.segs.filter((s) => s.id > rec.sumUpto && s.src);
   if (!fresh.length) return false;
   if (!force) {
@@ -1312,7 +1570,7 @@ async function summarize(rec) {
   let text = '';
   try {
     await chatStream({
-      model: S.set.trModel, messages, maxTokens: 1500, timeoutMs: 90000,
+      model: trModel(), messages, maxTokens: 1500, timeoutMs: 90000,
       onDelta: (d) => { text += d; if (rec === S.record) sumDelta(d); },
     });
     // only a complete summary replaces the old one and moves the “summarised up to” mark
@@ -1410,13 +1668,13 @@ function updateHeader() {
 }
 function updateKeyPill() {
   const p = $('#pill-key');
-  if (!S.set.apiKey) { p.textContent = '还没有密钥'; p.classList.remove('hidden'); } else if (S.keyBad) { p.textContent = '密钥有问题'; p.classList.remove('hidden'); } else p.classList.add('hidden');
+  if (!sttReady() || !llmReady()) { p.textContent = !sttKey() && !llmKey() ? '还没有密钥' : '服务没设置好'; p.classList.remove('hidden'); } else if (S.keyBad) { p.textContent = '密钥有问题'; p.classList.remove('hidden'); } else p.classList.add('hidden');
 }
 function updateNotice() {
   const seen = store.get('qaNoticeSeen', false);
   const n = $('#qa-notice');
   n.classList.toggle('hidden', seen);
-  if (!seen) n.textContent = `发送后，你的问题和选中的字幕会从这台 iPad 直接发给 ${apiHost() === 'api.openai.com' ? 'OpenAI' : apiHost()}（${S.set.qaModel}）；不会发给老师或同学。`;
+  if (!seen) n.textContent = `发送后，你的问题和选中的字幕会从这台 iPad 直接发给 ${S.set.llmProvider === 'custom' ? hostOf(llmBase()) : llmSvc().label}（${qaModel() || '模型未设置'}）；不会发给老师或同学。`;
 }
 
 // ------------------------------------------------------------------ sentence picker (same as the PC version)
@@ -1604,7 +1862,7 @@ function restoreRounds() {
 function sendQuestion() {
   const text = $('#qa-input').value.trim();
   if (!text) { toast('先写下你的问题'); $('#qa-input').focus(); return; }
-  if (!S.set.apiKey) { toast('先在设置里填 OpenAI API Key'); openSettings(); return; }
+  if (!llmReady()) { toast('先在设置里设置好翻译服务（密钥和模型）'); openSettings(); return; }
   if (S.qaBusy) { toast('上一个问题还在回答，可以先点“停止”'); return; }
   if (text.length > 2000) { toast('问题太长了（最多 2000 字）'); return; }
   const r = {
@@ -1633,7 +1891,7 @@ async function runRound(r) {
   const course = (S.record && S.record.course) || S.set.course;
   try {
     await chatStream({
-      model: S.set.qaModel, messages: qaMessages(r.question, r.refs, course, S.set.noAI), maxTokens: 900,
+      model: qaModel(), messages: qaMessages(r.question, r.refs, course, S.set.noAI), maxTokens: 900,
       effort: 'low', signal: ac.signal, timeoutMs: 120000,
       onDelta: (d) => {
         if (!S.qaBusy || S.qaBusy.qid !== r.qid) return;          // late text after “stop” is dropped
@@ -1784,7 +2042,7 @@ function joinDraft(before, add) {
 // pauses for that time (recorded as a gap) instead of opening a second microphone.
 async function toggleVoice() {
   if (S.dict) { finishVoice(); return; }
-  if (!S.set.apiKey) { toast('先在设置里填 OpenAI API Key'); openSettings(); return; }
+  if (!sttReady()) { toast('先在设置里设置好语音识别服务'); openSettings(); return; }
   const D = { chunks: [], voiced: 0, same: false, cap: null, rec: null, gap0: 0 };
   if (S.run && S.cap && !S.pause) {
     D.same = true;
@@ -1837,40 +2095,92 @@ async function finishVoice(cancel = false) {
 function openSettings() {
   const f = $('#settings-form');
   const s = S.set;
-  f.apiKey.value = '';
-  f.apiKey.placeholder = s.apiKey ? '留空表示不修改' : 'sk-…';
-  $('#key-saved').textContent = s.apiKey ? `已保存密钥（…${s.apiKey.slice(-4)}）` : '还没有保存密钥';
-  $('#btn-key-clear').classList.toggle('hidden', !s.apiKey);
-  f.baseUrl.value = s.baseUrl;
-  f.sttModel.value = s.sttModel;
+  f.llmProvider.value = s.llmProvider;
+  f.sttProvider.value = s.sttProvider;
+  f.llmKey.value = '';
+  f.sttKey.value = '';
+  f.volcToken.value = '';
+  f.volcAppId.value = s.volcAppId || '';
+  f.llmBase.value = s.llmBase;
   f.trModel.value = s.trModel;
   f.qaModel.value = s.qaModel;
+  f.sttBase.value = s.sttBase;
+  f.sttModel.value = s.sttModel;
   f.direction.value = s.direction;
   f.course.value = s.course;
   f.glossary.value = s.glossary;
   f.noAI.checked = !!s.noAI;
+  f.saveAudio.checked = s.saveAudio !== false;
   f.silenceMs.value = String(s.silenceMs);
+  refreshServiceForm();
   $('#test-result').textContent = '';
   $('#test-result').className = 'small';
   const dlg = $('#dlg-settings');
   if (!dlg.open) dlg.showModal();
 }
+// labels, placeholders and which key fields show, for the chosen services
+function refreshServiceForm() {
+  const f = $('#settings-form');
+  const s = S.set;
+  const lp = f.llmProvider.value, sp = f.sttProvider.value;
+  const L = LLM_SERVICES[lp], T = STT_SERVICES[sp];
+  const saved = (k) => (k ? `已保存（…${k.slice(-4)}）；留空表示不修改` : '');
+  const lk = s.keys[keyId('llm', lp)] || '';
+  $('#llm-key-label').textContent = `${L.label} 的 API Key`;
+  f.llmKey.placeholder = lk ? '已保存' : 'sk-…';
+  $('#llm-key-saved').textContent = saved(lk) || '还没有保存这个服务的密钥';
+  f.llmBase.placeholder = L.base ? `默认：${L.base}` : '（必填）';
+  f.trModel.placeholder = L.tr ? `默认：${L.tr}` : '留空：测试连接时从你账号的模型里自动选';
+  f.qaModel.placeholder = L.qa ? `默认：${L.qa}` : '留空：和翻译用同一个';
+  $('#llm-hint').textContent = L.hint || '';
+  if (!L.tr) $('#llm-adv').open = true;
+  const volc = sp === 'volc';
+  const same = !volc && keyId('stt', sp) === keyId('llm', lp);
+  $('#volc-box').classList.toggle('hidden', !volc);
+  $('#stt-key-box').classList.toggle('hidden', volc || same);
+  $('#stt-same').classList.toggle('hidden', !same);
+  $('#stt-same').textContent = same ? `和上面用同一个 ${T.label} 密钥。` : '';
+  const sk = s.keys[keyId('stt', sp)] || '';
+  f.sttKey.placeholder = sk ? '已保存' : '';
+  $('#stt-key-saved').textContent = saved(sk) || `还没有保存 ${T.label} 的密钥`;
+  $('#volc-saved').textContent = saved(s.keys.volcToken || '');
+  f.volcToken.placeholder = s.keys.volcToken ? '已保存' : '';
+  $('#stt-price').textContent = T.price ? `价格：${T.price}${/官网/.test(T.price) ? '' : '（以服务商官网为准）'}` : '';
+  f.sttBase.placeholder = T.base ? `默认：${T.base}` : '（必填）';
+  f.sttModel.placeholder = volc ? '不用填' : (T.model ? `默认：${T.model}` : '（必填）');
+  f.sttModel.disabled = volc;
+  const dl = $('#stt-models');
+  dl.innerHTML = '';
+  for (const m of T.models || []) { const o = document.createElement('option'); o.value = m; dl.appendChild(o); }
+  if (sp === 'custom') $('#stt-adv').open = true;
+}
 function formSettings() {
   const f = $('#settings-form');
-  const key = f.apiKey.value.trim();
+  const lp = f.llmProvider.value, sp = f.sttProvider.value;
+  const keys = { ...S.set.keys };
+  const lk = f.llmKey.value.trim(), sk = f.sttKey.value.trim(), vt = f.volcToken.value.trim();
+  for (const k of [lk, sk, vt]) if (k && !/^[\x21-\x7e]{16,}$/.test(k)) return { error: '密钥格式不对（应该是一长串字母、数字和符号，不能有空格或中文）' };
+  if (lk) keys[keyId('llm', lp)] = lk;
+  if (sk && sp !== 'volc' && keyId('stt', sp) !== keyId('llm', lp)) keys[keyId('stt', sp)] = sk;
+  if (vt) keys.volcToken = vt;
   const next = {
-    ...S.set, apiKey: key || S.set.apiKey, baseUrl: f.baseUrl.value.trim() || DEFAULTS.baseUrl,
-    sttModel: f.sttModel.value.trim() || DEFAULTS.sttModel, trModel: f.trModel.value.trim() || DEFAULTS.trModel,
-    qaModel: f.qaModel.value.trim() || DEFAULTS.qaModel, direction: f.direction.value, course: f.course.value.trim(),
-    glossary: f.glossary.value.trim(), noAI: f.noAI.checked, silenceMs: Number(f.silenceMs.value) || DEFAULTS.silenceMs,
+    ...S.set, keys, llmProvider: lp, sttProvider: sp, volcAppId: f.volcAppId.value.trim(),
+    llmBase: f.llmBase.value.trim(), trModel: f.trModel.value.trim(), qaModel: f.qaModel.value.trim(),
+    sttBase: f.sttBase.value.trim(), sttModel: sp === 'volc' ? '' : f.sttModel.value.trim(),
+    direction: f.direction.value, course: f.course.value.trim(), glossary: f.glossary.value.trim(), noAI: f.noAI.checked,
+    saveAudio: f.saveAudio.checked, silenceMs: Number(f.silenceMs.value) || DEFAULTS.silenceMs,
   };
-  if (key && !/^[\x21-\x7e]{20,}$/.test(key)) return { error: '密钥格式不对（应该是一长串字母数字，通常以 sk- 开头）' };
-  const bad = checkBase(next.baseUrl);
-  if (bad) return { error: bad };
+  for (const [url, what] of [[llmBase(next), '翻译服务'], [sttBase(next), '语音识别']]) {
+    if (!url) return { error: `${what}是自定义服务，要填接口地址` };
+    const bad = checkBase(url);
+    if (bad) return { error: `${what}：${bad}` };
+  }
+  if (sp === 'volc' && next.volcAppId && !/^\d{4,}$/.test(next.volcAppId)) return { error: '豆包语音的 APP ID 应该是一串数字' };
   return { next };
 }
 function applySettings(next) {
-  const keyChanged = next.apiKey !== S.set.apiKey || apiBase(next) !== apiBase();
+  const keyChanged = llmKey(next) !== llmKey() || sttKey(next) !== sttKey() || llmBase(next) !== llmBase()
+    || sttBase(next) !== sttBase() || next.volcAppId !== S.set.volcAppId;
   S.set = next;
   store.set('settings', S.set);
   if (keyChanged) S.keyBad = '';
@@ -1880,27 +2190,66 @@ function applySettings(next) {
   updateNotice();
   if (keyChanged && !S.keyBad && $('#banner').classList.contains('error')) hideBanner();
 }
+async function listModels(base, key) {
+  const r = await fetchT(base + '/models', { headers: { Authorization: `Bearer ${key}` } }, 15000);
+  if (r.status === 404) return null;                   // this service has no model list
+  if (!r.ok) throw friendly(r.status, await r.text());
+  return ((await r.json()).data || []).map((m) => m.id).filter(Boolean);
+}
+// translation service: the key works, and the models exist (or get picked from the account's list)
+async function testLlm(next) {
+  if (!llmKey(next)) throw new ApiError('还没填密钥');
+  const L = llmSvc(next);
+  const f = $('#settings-form');
+  const ids = await listModels(llmBase(next), llmKey(next));
+  if (ids) {
+    const dl = $('#llm-models');
+    dl.innerHTML = '';
+    for (const id of ids.slice().sort()) { const o = document.createElement('option'); o.value = id; dl.appendChild(o); }
+    if (!next.trModel && !ids.includes(trModel(next))) {
+      const pick = pickModel(L.prefer, ids);
+      if (!pick) throw new ApiError('连上了，但没有自动找到合适的模型，请在“模型和接口地址”里填一个');
+      next.trModel = pick;
+      f.trModel.value = pick;
+    }
+    if (!next.qaModel && !ids.includes(qaModel(next))) {
+      const pick = pickModel(L.qaPrefer || L.prefer, ids) || trModel(next);
+      next.qaModel = pick;
+      f.qaModel.value = pick;
+    }
+    const missing = [trModel(next), qaModel(next)].filter((m) => !ids.includes(m));
+    if (missing.length) throw new ApiError(`连上了，但账号里没有 ${missing.join('、')}，请换成列表里有的模型`);
+    return `可以用（${trModel(next)}）`;
+  }
+  if (!trModel(next)) throw new ApiError(`连上了，但这个服务不提供模型列表，请在“模型和接口地址”里填模型名。${L.hint || ''}`);
+  return `可以连上（${trModel(next)}，没有预检模型名）`;
+}
+// speech-to-text: the key works (豆包语音: half a second of silence, answered as “silence”)
+async function testStt(next) {
+  if (!sttReady(next)) throw new ApiError(next.sttProvider === 'volc' ? '还没填 APP ID 或 Access Token' : '还没填密钥');
+  if (sttSvc(next).kind === 'volc') {
+    await transcribe(new Int16Array(8000), {}, next);
+    return '豆包语音可以用';
+  }
+  const ids = await listModels(sttBase(next), sttKey(next));
+  if (ids && ids.some((m) => /whisper|transcribe|sensevoice|speech|asr/i.test(m)) && !ids.includes(sttModel(next))) {
+    throw new ApiError(`连上了，但账号里没有 ${sttModel(next)}`);
+  }
+  return `可以用（${sttModel(next)}）`;
+}
 async function testConnection() {
   const out = $('#test-result');
   const { next, error } = formSettings();
   if (error) { out.className = 'small err'; out.textContent = error; return; }
-  if (!next.apiKey) { out.className = 'small err'; out.textContent = '先填 API Key'; return; }
   out.className = 'small';
   out.textContent = '正在测试…';
-  const t0 = performance.now();
-  try {
-    const r = await fetchT(apiBase(next) + '/models', { headers: { Authorization: `Bearer ${next.apiKey}` } }, 15000);
-    if (!r.ok) throw friendly(r.status, await r.text());
-    const ids = ((await r.json()).data || []).map((m) => m.id).filter(Boolean);
-    const dl = $('#all-models');
-    dl.innerHTML = '';
-    for (const id of ids.filter((m) => /^(gpt|o\d|chatgpt)/i.test(m)).sort()) { const o = document.createElement('option'); o.value = id; dl.appendChild(o); }
-    const missing = [next.sttModel, next.trModel, next.qaModel].filter((m) => !ids.includes(m));
-    if (missing.length) { out.className = 'small err'; out.textContent = `连上了，但这个密钥用不了：${missing.join('、')}。请换成列表里有的模型。`; } else {
-      out.className = 'small ok';
-      out.textContent = `连接成功（${((performance.now() - t0) / 1000).toFixed(1)} 秒），识别、翻译、问答三个模型都可以用。`;
-    }
-  } catch (e) { out.className = 'small err'; out.textContent = errText(e); }
+  const parts = [];
+  let ok = true;
+  for (const [name, fn] of [['翻译', testLlm], ['识别', testStt]]) {
+    try { parts.push(`${name}：${await fn(next)}`); } catch (e) { ok = false; parts.push(`${name}：${errText(e)}`); }
+  }
+  out.className = ok ? 'small ok' : 'small err';
+  out.textContent = (ok ? '连接成功。' : '') + parts.join('；');
 }
 
 // ------------------------------------------------------------------ past records and notes
@@ -1929,9 +2278,11 @@ function renderHistory() {
     li.innerHTML = '<div class="name"><b></b><span class="meta"></span></div>'
       + '<button class="btn small" type="button" data-act="open">打开</button>'
       + '<button class="btn small" type="button" data-act="export">导出</button>'
+      + (d.recChunks ? '<button class="btn small" type="button" data-act="audio">导出录音</button>' : '')
       + '<button class="btn small ghost danger" type="button" data-act="delete">删除</button>';
     $('b', li).textContent = fmtDate(d.createdAt) + (d.course ? ` · ${d.course}` : '');
-    $('.meta', li).textContent = `${(d.segs || []).length} 句 · ${mmss(d.clock || 0)}${cur ? ' · 正在显示' : ''}`;
+    const recInfo = d.recChunks ? ` · 录音约 ${Math.max(1, Math.round((d.recEnd || 0) / 60))} 分钟（${Math.round((d.recEnd || 0) * SR * 2 / 1e6)} MB）` : '';
+    $('.meta', li).textContent = `${(d.segs || []).length} 句 · ${mmss(d.clock || 0)}${recInfo}${cur ? ' · 正在显示' : ''}`;
     li.addEventListener('click', (e) => {
       const b = e.target.closest('[data-act]');
       if (b) historyAction(b.dataset.act, d);
@@ -1945,6 +2296,8 @@ async function historyAction(act, d) {
     const rec = cur ? S.record : d;
     const how = await exportText(recordFileName(rec), buildMarkdown(rec));
     if (how === 'downloaded') toast('已下载（在“文件 → 下载”里）');
+  } else if (act === 'audio') {
+    await exportRecording(cur ? S.record : d);
   } else if (act === 'open') {
     if (cur) { $('#dlg-history').close(); return; }
     if (S.run || S.stopping) { toast('先停止录音，再打开别的记录'); return; }
@@ -1953,9 +2306,10 @@ async function historyAction(act, d) {
     $('#dlg-history').close();
   } else if (act === 'delete') {
     if (cur && (S.run || S.stopping)) { toast('正在录音的记录不能删除'); return; }
-    if (!confirm(`删除“${fmtDate(d.createdAt)}${d.course ? ' · ' + d.course : ''}”这份记录？删除后不能恢复（我的笔记不受影响）。`)) return;
+    if (!confirm(`删除“${fmtDate(d.createdAt)}${d.course ? ' · ' + d.course : ''}”这份记录${d.recChunks ? '和它的录音' : ''}？删除后不能恢复（我的笔记不受影响）。`)) return;
     try {
       await DB.del('records', d.id);
+      await DB.delOf('audio', d.id);
       historyCache.records = historyCache.records.filter((x) => x.id !== d.id);
       if (cur) { S.record = null; switchRecord(null); setRunUI('idle'); }
       renderHistory();
@@ -2014,9 +2368,17 @@ function bind() {
   $('#btn-sum').addEventListener('click', () => {
     if (!S.record) { toast('还没有字幕可以总结'); return; }
     if (rt(S.record).sumBusy) { toast('正在更新总结'); return; }
-    if (!maybeSummary(S.record, true)) toast(S.set.apiKey ? '没有新的内容需要总结' : '先在设置里填 OpenAI API Key');
+    if (!maybeSummary(S.record, true)) toast(llmReady() ? '没有新的内容需要总结' : '先在设置里设置好翻译服务');
   });
   $('#summary').addEventListener('click', (e) => { const b = e.target.closest('.tchip'); if (b) jumpToTime(toSeconds(b.dataset.t)); });
+  $('#btn-player').addEventListener('click', () => togglePlayer());
+  $('#btn-audio-export').addEventListener('click', () => { if (S.record) exportRecording(S.record); });
+  $('#captions').addEventListener('click', (e) => {          // after class: a caption's time plays the recording from there
+    const ts = e.target.closest('.cap .ts');
+    if (!ts || !playable()) return;
+    const seg = S.byId.get(Number(ts.closest('.cap').dataset.id));
+    if (seg) playFrom(seg.t0);
+  });
   $('#chk-autosum').addEventListener('change', (e) => { S.set.autoSum = e.target.checked; store.set('settings', S.set); });
   $('#chk-src').addEventListener('change', (e) => { store.set('showSrc', e.target.checked); document.body.classList.toggle('hide-src', !e.target.checked); });
   const font = (d) => {
@@ -2100,10 +2462,13 @@ function bind() {
   $('#btn-cancel').addEventListener('click', () => $('#dlg-settings').close());
   $('#btn-test').addEventListener('click', testConnection);
   $('#btn-key-clear').addEventListener('click', () => {
-    if (!confirm('从这台 iPad 删除已保存的 API Key？')) return;
-    applySettings({ ...S.set, apiKey: '' });
+    if (!confirm('从这台 iPad 删除所有保存的密钥（各个服务的 API Key 和豆包语音的 Access Token）？')) return;
+    applySettings({ ...S.set, keys: {}, volcAppId: '' });
     openSettings();
   });
+  // switching a service: its own defaults apply again (model names and addresses differ per service)
+  f.llmProvider.addEventListener('change', () => { f.trModel.value = ''; f.qaModel.value = ''; f.llmBase.value = ''; refreshServiceForm(); });
+  f.sttProvider.addEventListener('change', () => { f.sttModel.value = ''; f.sttBase.value = ''; refreshServiceForm(); });
 
   // past records
   $('#btn-export-notes').addEventListener('click', exportNotes);
@@ -2114,9 +2479,9 @@ function bind() {
       if (S.run) keepAwake(true);
       if (S.cap && S.cap.ctx.state !== 'running') S.cap.ctx.resume().catch(() => {});
       setTimeout(() => { if (S.pause) { maybeEndPause(); if (S.pause) showPauseBanner(); } }, 1200);
-    } else if (S.record) saveRecord(S.record);
+    } else { flushAudio(); if (S.record) saveRecord(S.record); }
   });
-  window.addEventListener('pagehide', () => { if (S.record) saveRecord(S.record); saveRounds(); });
+  window.addEventListener('pagehide', () => { flushAudio(); if (S.record) saveRecord(S.record); saveRounds(); });
   window.matchMedia('(max-width: 900px)').addEventListener('change', () => { setLatest(); if (S.picker) placePicker(); });
   window.addEventListener('resize', renderSave, { passive: true });
 }
