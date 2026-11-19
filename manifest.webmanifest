@@ -1,0 +1,17 @@
+{
+  "name": "课堂翻译",
+  "short_name": "课堂翻译",
+  "description": "上课实时字幕、翻译、总结和私下问答（iPad 网页版）",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f1f1ee",
+  "theme_color": "#f1f1ee",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon-180.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

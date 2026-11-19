@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="课堂翻译">
+  <meta name="theme-color" content="#f1f1ee">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https: http://127.0.0.1:* http://localhost:*; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; object-src 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>课堂翻译</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="icon" href="icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body data-view="cap" class="ipad">
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-big" viewBox="0 0 24 24"><path d="M4 7V5h16v2M12 5v14M9 19h6"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2.5"/><path d="M16 8V6.5A2.5 2.5 0 0 0 13.5 4h-7A2.5 2.5 0 0 0 4 6.5v7A2.5 2.5 0 0 0 6.5 16H8"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2.5-6.5z"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5"/></symbol>
+  </svg>
+
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <h1 class="title">课堂翻译</h1>
+        <span id="course-name" class="course-name"></span>
+      </div>
+      <div class="top-status">
+        <span id="rec-state" class="rec-state">未开始</span>
+        <span id="timer" class="num timer">00:00</span>
+        <button id="pill-key" class="chip warn hidden" type="button">还没有密钥</button>
+        <span id="save-pill" class="chip save-pill hidden"></span>
+        <button id="btn-big" class="btn top-btn" type="button" title="只看大号字幕，适合放在 Slide Over / 分屏里"><svg class="i"><use href="#i-big"/></svg><span class="lbl">大字幕</span></button>
+        <button id="btn-new" class="btn top-btn" type="button" title="这一份保存好，马上开始新的一份录音"><svg class="i"><use href="#i-plus"/></svg><span class="lbl">新录音</span></button>
+        <button id="btn-start" class="btn primary start-btn" type="button"><svg class="i"><use href="#i-mic"/></svg><span class="lbl-long">开始录音</span><span class="lbl-short">开始</span></button>
+        <button id="btn-history" class="btn small ghost icon-btn" type="button" title="以前的记录" aria-label="以前的记录"><svg class="i"><use href="#i-list"/></svg></button>
+        <button id="btn-settings" class="btn small ghost icon-btn" type="button" title="设置" aria-label="设置"><svg class="i"><use href="#i-sliders"/></svg></button>
+      </div>
+    </header>
+
+    <section id="details" class="details">
+      <div class="stat"><span class="k">音量</span><div class="meter" title="iPad 麦克风收到的音量"><div id="meter-bar"></div></div></div>
+      <div class="stat" title="一句话说完，到第一个译文字出现的时间"><span id="lat-k" class="k">延迟</span><b id="latency" class="num">—</b></div>
+      <div class="stat"><span class="k">识别中</span><b id="pending" class="num">0</b></div>
+      <div class="stat" title="已上传给 OpenAI 识别的音频时长（只上传有人说话的片段），语音识别按这个计费"><span class="k">识别音频</span><b id="audio-min" class="num">0 分钟</b></div>
+      <span class="spacer"></span>
+      <span id="keep-on" class="small muted keep-on">录音时请让这个页面留在前台</span>
+    </section>
+
+    <div id="banner" class="banner hidden" role="status">
+      <span id="banner-text"></span>
+      <button id="banner-close" class="x" type="button" aria-label="关闭">×</button>
+    </div>
+
+    <nav class="viewbar" aria-label="切换内容">
+      <button id="view-cap" class="tab on" type="button">字幕</button>
+      <button id="view-qa" class="tab" type="button">问答<span id="view-qa-badge" class="badge hidden"></span></button>
+      <button id="view-sum" class="tab" type="button">总结<span id="view-sum-badge" class="badge hidden"></span></button>
+    </nav>
+
+    <main class="cols">
+      <section id="col-cap" class="col col-cap" aria-label="课堂字幕">
+        <div class="col-head">
+          <h2>课堂字幕</h2>
+          <span id="dir-label" class="sub"></span>
+          <span class="spacer"></span>
+          <div class="popover-wrap">
+            <button id="btn-display" class="btn small ghost" type="button" aria-expanded="false" aria-controls="display-pop">显示选项<svg class="i"><use href="#i-chev"/></svg></button>
+            <div id="display-pop" class="popover hidden" role="group" aria-label="显示选项">
+              <label class="check"><input type="checkbox" id="chk-src" checked> 显示原文</label>
+              <div class="row"><span class="small muted">字号</span>
+                <button id="btn-font-dec" class="btn small" type="button" title="缩小字号">A−</button>
+                <button id="btn-font-inc" class="btn small" type="button" title="放大字号">A+</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="captions-wrap">
+          <div id="captions" class="captions scroll">
+            <div id="empty" class="empty">
+              <h3>点右上角「开始录音」</h3>
+              <p>第一次使用先点右上角 <b>设置</b> 填 OpenAI API Key（只存在这台 iPad 上）。录音时让这个页面留在前台，屏幕会保持常亮。</p>
+              <p id="tip-home" class="tip-home">建议先在 Safari 点 <b>分享 → 添加到主屏幕</b>，以后从主屏幕图标打开：全屏显示，记录也不会被 Safari 自动清理。（从图标打开后需要重新填一次密钥。）</p>
+              <p>想把字幕放在课件旁边：把这个页面拖成 <b>分屏</b> 或 <b>Slide Over</b>，再点 <b>大字幕</b>。</p>
+            </div>
+            <div id="live" class="live"></div>
+          </div>
+          <button id="btn-jump" class="btn primary jump hidden" type="button">↓ 回到最新</button>
+        </div>
+      </section>
+
+      <section id="col-side" class="col col-side" aria-label="AI 问答与课堂总结">
+        <div class="side-head">
+          <div class="seg-tabs" role="tablist" aria-label="右栏">
+            <button id="tab-qa" class="tab on" role="tab" type="button">AI 问答</button>
+            <button id="tab-sum" class="tab" role="tab" type="button">课堂总结<span id="sum-badge" class="badge hidden"></span></button>
+          </div>
+        </div>
+        <div id="latest-bar" class="latest-bar hidden" aria-label="最新字幕"></div>
+
+        <div id="qa-view" class="qa-view">
+          <div id="thread" class="thread scroll" aria-label="问答记录">
+            <p class="muted small thread-empty">在字幕上点<b>问这句</b>，或直接在下面提问；也可以点<b>语音</b>说出问题。问答只在这台 iPad 上，不写进课堂记录。</p>
+          </div>
+          <div id="refs" class="refs"></div>
+          <div class="composer">
+            <label for="qa-input" class="qa-label">我的问题</label>
+            <div id="dict-state" class="dict-state hidden" aria-live="polite"></div>
+            <textarea id="qa-input" rows="3" placeholder="例如：怎么从这两句判断该记录什么？"></textarea>
+            <p id="qa-notice" class="qa-notice"></p>
+            <div class="composer-row">
+              <button id="btn-voice" class="btn voice" type="button" aria-pressed="false" title="说出你的问题，再点一次结束；文字会放进草稿，不会自动发送"><svg class="i"><use href="#i-mic"/></svg><span class="lbl">语音</span></button>
+              <span class="spacer"></span>
+              <button id="btn-send" class="btn primary send" type="button"><svg class="i"><use href="#i-send"/></svg>发送</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="sum-view" class="sum-view hidden">
+          <div class="sum-top">
+            <span id="sum-state" class="sub">开始后约每 2 分钟更新</span>
+            <span class="spacer"></span>
+            <label class="check"><input type="checkbox" id="chk-autosum" checked> 自动</label>
+            <button id="btn-sum" class="btn small" type="button">更新总结</button>
+          </div>
+          <div id="summary" class="summary scroll">
+            <p class="muted">只总结课堂内容。要点后的时间可以点，跳到那一句字幕。</p>
+          </div>
+        </div>
+
+        <div id="picker" class="picker hidden" role="dialog" aria-modal="false" aria-labelledby="picker-title">
+          <div class="sheet-grip" aria-hidden="true"></div>
+          <div id="picker-latest" class="picker-latest"></div>
+          <div class="picker-head">
+            <h3 id="picker-title">选择要问的字幕</h3>
+            <button id="picker-cancel" class="btn small ghost" type="button">取消</button>
+          </div>
+          <div class="picker-sub">
+            <span id="picker-count" aria-live="polite">已选 0 句</span>
+            <span class="spacer"></span>
+            <button id="picker-range" class="btn small" type="button" aria-pressed="false" title="先勾一句，再点“连选”，然后点另一句：中间的都选上">连选</button>
+            <button id="picker-none" class="btn small ghost" type="button">清空</button>
+          </div>
+          <div id="picker-list" class="picker-list scroll" role="group" aria-label="本节课的字幕"></div>
+          <button id="picker-more" class="picker-more hidden" type="button"></button>
+          <div class="picker-foot">
+            <button id="picker-free" class="btn small ghost" type="button">不选字幕，直接提问</button>
+            <button id="picker-ok" class="btn primary" type="button" disabled>用选中的 0 句提问</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="sr-live" class="sr-only" aria-live="polite"></div>
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <!-- settings -->
+  <dialog id="dlg-settings">
+    <form id="settings-form" method="dialog">
+      <h2>设置</h2>
+      <fieldset>
+        <legend>OpenAI</legend>
+        <label class="field col"><span>API Key</span>
+          <input type="password" name="apiKey" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="sk-…">
+        </label>
+        <div class="key-row">
+          <span id="key-saved" class="hint"></span>
+          <button id="btn-key-clear" class="btn small ghost danger hidden" type="button">删除已保存的密钥</button>
+        </div>
+        <div class="hint">密钥只存在这台 iPad 的浏览器里，由 iPad 直接发给 OpenAI，不经过别的服务器。建议在 OpenAI 后台给这个密钥设一个用量上限。</div>
+        <div class="row">
+          <button id="btn-test" class="btn small" type="button">测试连接</button>
+          <span id="test-result" class="small"></span>
+        </div>
+        <details>
+          <summary>模型和接口地址</summary>
+          <label class="field col"><span>语音识别模型（约 0.003 美元/分钟；gpt-4o-transcribe 更准，约贵一倍）</span><input name="sttModel" list="stt-models" spellcheck="false" autocapitalize="off"></label>
+          <label class="field col"><span>翻译和总结模型</span><input name="trModel" list="all-models" spellcheck="false" autocapitalize="off"></label>
+          <label class="field col"><span>问答模型</span><input name="qaModel" list="all-models" spellcheck="false" autocapitalize="off"></label>
+          <label class="field col"><span>接口地址</span><input name="baseUrl" spellcheck="false" autocapitalize="off"></label>
+          <datalist id="stt-models"><option value="gpt-4o-mini-transcribe"><option value="gpt-4o-transcribe"><option value="whisper-1"></datalist>
+          <datalist id="all-models"></datalist>
+        </details>
+      </fieldset>
+      <fieldset>
+        <legend>这节课</legend>
+        <label class="field col"><span>方向</span>
+          <select name="direction">
+            <option value="en2zh">英 → 中</option>
+            <option value="zh2en">中 → 英</option>
+            <option value="auto">中英自动互译</option>
+          </select>
+        </label>
+        <label class="field col"><span>课程名称（会用来帮助识别和翻译）</span><input name="course" maxlength="80" placeholder="例如：Interaction Design — Week 8"></label>
+        <label class="field col"><span>术语表（每行“English = 中文”）</span><textarea name="glossary" rows="4" placeholder="usability testing = 可用性测试"></textarea></label>
+        <label class="check"><input type="checkbox" name="noAI"> 这门课的作业不允许使用 AI（问答只解释概念，不写作业内容）</label>
+        <label class="field col"><span>停顿多久算一句话结束</span>
+          <select name="silenceMs">
+            <option value="500">0.5 秒（最快，可能把一句切开）</option>
+            <option value="700">0.7 秒（默认）</option>
+            <option value="900">0.9 秒（说话慢、停顿多时）</option>
+            <option value="1200">1.2 秒</option>
+          </select>
+        </label>
+      </fieldset>
+      <div class="actions">
+        <span class="spacer"></span>
+        <button class="btn" type="button" id="btn-cancel">取消</button>
+        <button class="btn primary" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- past records -->
+  <dialog id="dlg-history">
+    <form method="dialog">
+      <h2>以前的记录</h2>
+      <p class="hint">记录只存在这台 iPad 上。导出后可以存到“文件”、隔空投送到电脑，或发给自己。</p>
+      <ul id="history-list" class="file-list"></ul>
+      <div class="actions">
+        <button id="btn-export-notes" class="btn ghost" type="button">导出我的笔记</button>
+        <span class="spacer"></span>
+        <button class="btn" type="submit">关闭</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
