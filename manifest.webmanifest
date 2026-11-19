@@ -1,7 +1,7 @@
 {
   "name": "课堂翻译",
   "short_name": "课堂翻译",
-  "description": "上课实时字幕、翻译、总结和私下问答（iPad 网页版）",
+  "description": "上课实时字幕、翻译、总结、私下问答和课堂录音（iPad / Mac / Windows 网页版）",
   "lang": "zh-CN",
   "start_url": "./",
   "scope": "./",

@@ -26,6 +26,8 @@
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2.5"/><path d="M16 8V6.5A2.5 2.5 0 0 0 13.5 4h-7A2.5 2.5 0 0 0 4 6.5v7A2.5 2.5 0 0 0 6.5 16H8"/></symbol>
     <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2.5-6.5z"/></symbol>
     <symbol id="i-chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-pip" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2.5"/><rect x="11.5" y="11.5" width="7" height="5" rx="1.2"/></symbol>
+    <symbol id="i-install" viewBox="0 0 24 24"><path d="M12 4v10M8 10l4 4 4-4M5 18h14"/></symbol>
     <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5"/></symbol>
   </svg>
 
@@ -41,6 +43,7 @@
         <span id="timer" class="num timer">00:00</span>
         <button id="pill-key" class="chip warn hidden" type="button">还没有密钥</button>
         <span id="save-pill" class="chip save-pill hidden"></span>
+        <button id="btn-pip" class="btn top-btn hidden" type="button" title="置顶的小字幕窗，可以拖到课件或网课画面上（只显示课堂字幕）"><svg class="i"><use href="#i-pip"/></svg><span class="lbl">悬浮字幕</span></button>
         <button id="btn-big" class="btn top-btn" type="button" title="只看大号字幕，适合放在 Slide Over / 分屏里"><svg class="i"><use href="#i-big"/></svg><span class="lbl">大字幕</span></button>
         <button id="btn-new" class="btn top-btn" type="button" title="这一份保存好，马上开始新的一份录音"><svg class="i"><use href="#i-plus"/></svg><span class="lbl">新录音</span></button>
         <button id="btn-start" class="btn primary start-btn" type="button"><svg class="i"><use href="#i-mic"/></svg><span class="lbl-long">开始录音</span><span class="lbl-short">开始</span></button>
@@ -50,10 +53,11 @@
     </header>
 
     <section id="details" class="details">
-      <div class="stat"><span class="k">音量</span><div class="meter" title="iPad 麦克风收到的音量"><div id="meter-bar"></div></div></div>
+      <div class="stat"><span class="k">音量</span><div class="meter" title="麦克风收到的音量"><div id="meter-bar"></div></div></div>
       <div class="stat" title="一句话说完，到第一个译文字出现的时间"><span id="lat-k" class="k">延迟</span><b id="latency" class="num">—</b></div>
       <div class="stat"><span class="k">识别中</span><b id="pending" class="num">0</b></div>
-      <div class="stat" title="已上传给 OpenAI 识别的音频时长（只上传有人说话的片段），语音识别按这个计费"><span class="k">识别音频</span><b id="audio-min" class="num">0 分钟</b></div>
+      <div class="stat"><span class="k">来源</span><b id="source-label" class="num">麦克风</b></div>
+      <div class="stat" title="已上传给语音识别服务的音频时长（只上传有人说话的片段），语音识别按这个计费"><span class="k">识别音频</span><b id="audio-min" class="num">0 分钟</b></div>
       <span class="spacer"></span>
       <span id="keep-on" class="small muted keep-on">录音时请让这个页面留在前台</span>
     </section>
@@ -84,6 +88,7 @@
                 <button id="btn-font-dec" class="btn small" type="button" title="缩小字号">A−</button>
                 <button id="btn-font-inc" class="btn small" type="button" title="放大字号">A+</button>
               </div>
+              <button id="btn-big2" class="btn small hidden" type="button" aria-pressed="false" title="只看大号字幕，适合把窗口缩小放在课件旁边">大字幕模式</button>
             </div>
           </div>
         </div>
@@ -95,9 +100,10 @@
           <div id="captions" class="captions scroll">
             <div id="empty" class="empty">
               <h3>点右上角「开始录音」</h3>
-              <p>第一次使用先点右上角 <b>设置</b>，选翻译和语音识别用的服务（OpenAI、DeepSeek、豆包等），填它们的密钥（只存在这台 iPad 上）。录音时让这个页面留在前台，屏幕会保持常亮。</p>
-              <p id="tip-home" class="tip-home">建议先在 Safari 点 <b>分享 → 添加到主屏幕</b>，以后从主屏幕图标打开：全屏显示，记录也不会被 Safari 自动清理。（从图标打开后需要重新填一次密钥。）</p>
-              <p>想把字幕放在课件旁边：把这个页面拖成 <b>分屏</b> 或 <b>Slide Over</b>，再点 <b>大字幕</b>。</p>
+              <p>第一次使用先点右上角 <b>设置</b>，选翻译和语音识别用的服务（OpenAI、DeepSeek、豆包等），填它们的密钥（只存在这台设备上）。<span id="tip-front">录音时让这个页面留在前台，屏幕会保持常亮。</span></p>
+              <p id="tip-home" class="tip-home"><span id="tip-install-text">建议先在 Safari 点 <b>分享 → 添加到主屏幕</b>，以后从主屏幕图标打开：全屏显示，记录也不会被 Safari 自动清理。（从图标打开后需要重新填一次密钥。）</span>
+                <button id="btn-install" class="btn small primary hidden" type="button"><svg class="i"><use href="#i-install"/></svg>安装到这台电脑</button></p>
+              <p id="tip-side">想把字幕放在课件旁边：把这个页面拖成 <b>分屏</b> 或 <b>Slide Over</b>，再点 <b>大字幕</b>。</p>
             </div>
             <div id="live" class="live"></div>
           </div>
@@ -116,7 +122,7 @@
 
         <div id="qa-view" class="qa-view">
           <div id="thread" class="thread scroll" aria-label="问答记录">
-            <p class="muted small thread-empty">在字幕上点<b>问这句</b>，或直接在下面提问；也可以点<b>语音</b>说出问题。问答只在这台 iPad 上，不写进课堂记录。</p>
+            <p class="muted small thread-empty">在字幕上点<b>问这句</b>，或直接在下面提问；也可以点<b>语音</b>说出问题。问答只在这台设备上，不写进课堂记录。</p>
           </div>
           <div id="refs" class="refs"></div>
           <div class="composer">
@@ -238,7 +244,7 @@
         <span id="test-result" class="small"></span>
       </div>
       <div class="key-row">
-        <span class="hint">密钥只存在这台 iPad 的浏览器里，由 iPad 直接发给对应的服务，不经过别的服务器。建议在服务商后台给密钥设一个用量上限。</span>
+        <span class="hint">密钥只存在这台设备的浏览器里，直接发给对应的服务，不经过别的服务器。建议在服务商后台给密钥设一个用量上限。</span>
         <button id="btn-key-clear" class="btn small ghost danger" type="button">删除所有保存的密钥</button>
       </div>
       <fieldset>
@@ -253,7 +259,16 @@
         <label class="field col"><span>课程名称（会用来帮助识别和翻译）</span><input name="course" maxlength="80" placeholder="例如：Interaction Design — Week 8"></label>
         <label class="field col"><span>术语表（每行“English = 中文”）</span><textarea name="glossary" rows="4" placeholder="usability testing = 可用性测试"></textarea></label>
         <label class="check"><input type="checkbox" name="noAI"> 这门课的作业不允许使用 AI（问答只解释概念，不写作业内容）</label>
-        <label class="check"><input type="checkbox" name="saveAudio"> 保存课堂录音（存在这台 iPad 上，约每小时 115 MB；可以在“以前的记录”里导出或删除）</label>
+        <div id="source-field" class="hidden">
+          <label class="field col"><span>声音来源</span>
+            <select name="source">
+              <option value="mic">麦克风（教室上课）</option>
+              <option value="system">电脑声音（网课、视频会议、视频）</option>
+            </select>
+          </label>
+          <div class="hint">选“电脑声音”时，开始录音后浏览器会问共享什么：选课程所在的<b>标签页</b>并打开“共享标签页音频”，或在 Windows 上选<b>整个屏幕</b>并打开“共享系统音频”。这时语音提问会用麦克风单独录，课堂转写不停。</div>
+        </div>
+        <label class="check"><input type="checkbox" name="saveAudio"> 保存课堂录音（存在这台设备上，约每小时 115 MB；可以在“以前的记录”里导出或删除）</label>
         <label class="field col"><span>停顿多久算一句话结束</span>
           <select name="silenceMs">
             <option value="500">0.5 秒（最快，可能把一句切开）</option>
@@ -275,7 +290,7 @@
   <dialog id="dlg-history">
     <form method="dialog">
       <h2>以前的记录</h2>
-      <p class="hint">记录只存在这台 iPad 上。导出后可以存到“文件”、隔空投送到电脑，或发给自己。</p>
+      <p class="hint">记录只存在这台设备上。导出后可以存到“文件”或下载文件夹、隔空投送，或发给自己。</p>
       <ul id="history-list" class="file-list"></ul>
       <div class="actions">
         <button id="btn-export-notes" class="btn ghost" type="button">导出我的笔记</button>

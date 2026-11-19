@@ -1,10 +1,10 @@
 'use strict';
 
-/* 课堂翻译 · iPad — runs entirely in this page, no computer needed.
+/* 课堂翻译 · web version (iPad, Mac, Windows) — runs entirely in this page, no server of its own.
    The microphone is cut into sentences here (energy-based voice detection); each sentence goes to
    OpenAI speech-to-text, then a GPT model translates it, keeps a running class summary and answers
-   private questions about ticked sentences. The API key, records and notes stay on this iPad
-   (localStorage / IndexedDB); requests go straight from the iPad to the API.
+   private questions about ticked sentences. The API keys, records, notes and recordings stay on this
+   device (localStorage / IndexedDB); requests go straight from the device to the chosen services.
    Same look, prompts and record format as the PC version (static/app.js, llm.py, records.py).
 
    Record isolation: every async step (recognition, translation, summary) holds the record it
@@ -59,7 +59,7 @@ const STT_SERVICES = {
 const DEFAULTS = {
   llmProvider: 'openai', sttProvider: 'openai', keys: {}, volcAppId: '',
   llmBase: '', trModel: '', qaModel: '', sttBase: '', sttModel: '',      // empty = the service's default
-  direction: 'en2zh', course: '', glossary: '', noAI: false, silenceMs: 700, autoSum: true, saveAudio: true,
+  direction: 'en2zh', course: '', glossary: '', noAI: false, silenceMs: 700, autoSum: true, saveAudio: true, source: 'mic',
 };
 const DIRECTION_LABEL = { en2zh: '英 → 中', zh2en: '中 → 英', auto: '中英自动互译' };
 const GAP_REASON = {
@@ -67,6 +67,16 @@ const GAP_REASON = {
   ended: '麦克风断开了', stalled: '没有收到声音',
 };
 const SR = 16000;
+// iPad and iPhone (iPadOS reports itself as a Mac with touch), Safari, desktop Chrome/Edge
+const PLATFORM = (() => {
+  const ua = navigator.userAgent;
+  const ios = /iPad|iPhone|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  const safari = /Safari/.test(ua) && !/Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS/.test(ua);
+  return { ios, safari, mac: /Macintosh/.test(ua) && !ios, desktop: !ios && !/Android|Mobile/.test(ua) };
+})();
+const CAN_PIP = 'documentPictureInPicture' in window;                     // floating captions: desktop Chrome/Edge
+const CAN_SYSTEM_AUDIO = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) && !PLATFORM.ios && !PLATFORM.safari;
+const KEEP_DESKTOP = '录音时不要关掉这个页面；可以切到别的窗口';
 const KEEP_RECENT_MS = 3 * 3600 * 1000;          // reopening within 3 h shows the last record again
 
 const S = {
@@ -210,7 +220,7 @@ async function fetchT(url, opts = {}, ms = 30000) {
   } catch (e) {
     if (outer && outer.aborted) throw new ApiError('已停止', { kind: 'aborted' });
     if (timedOut) throw new ApiError('请求超时，网络可能不稳定', { retryable: true, kind: 'incomplete' });
-    throw new ApiError('网络连接失败，请检查 iPad 的网络', { retryable: true, kind: 'incomplete' });
+    throw new ApiError('网络连接失败，请检查网络', { retryable: true, kind: 'incomplete' });
   } finally {
     clearTimeout(timer);
     if (outer) outer.removeEventListener('abort', onAbort);
@@ -679,7 +689,7 @@ function renderSave() {
   } else if (x.saved.state === 'saved' && x.saved.upto) {
     pill.className = 'chip save-pill';
     pill.textContent = short ? `已存 ${x.saved.upto}` : `已保存到 ${x.saved.upto}`;
-    pill.title = '已存在这台 iPad 上';
+    pill.title = '已存在这台设备上';
   } else if (x.saving && rec.segs.some((s) => s.src)) {
     pill.className = 'chip save-pill pending';
     pill.textContent = '保存中…';
@@ -693,7 +703,7 @@ function buildMarkdown(rec) {
   const L = [`# 实时翻译记录 · ${fmtDate(rec.createdAt)}`, ''];
   if (rec.course) L.push(`- 课程：${rec.course}`);
   L.push(`- 方向：${DIRECTION_LABEL[rec.direction] || rec.direction}`, `- 记录编号：${rec.id}`,
-    `- 翻译：${rec.trModel || ''}；语音识别：${rec.sttModel || ''}（iPad 网页版）`,
+    `- 翻译：${rec.trModel || ''}；语音识别：${rec.sttModel || ''}（网页版）`,
     '- 说明：自动识别与机器翻译，未经人工校对；私下的问答不在这份记录里');
   if (rec.recChunks) L.push(`- 录音：在“以前的记录”里点“导出录音”（WAV，约 ${Math.round(rec.recEnd / 60)} 分钟；录音里的时间和下面每句前的时间一致）`);
   L.push('');
@@ -743,16 +753,31 @@ function makeContext() {
   const AC = window.AudioContext || window.webkitAudioContext;
   return new AC({ latencyHint: 'interactive' });       // created inside the tap, so iPadOS lets it run
 }
-async function openCapture(ctx, onPcm) {
+// source "mic": the microphone; "system": a shared tab or screen with its sound (online classes, videos),
+// desktop Chrome/Edge only. Called straight from a tap: both need a user action.
+async function openCapture(ctx, onPcm, source = 'mic') {
   let stream;
   try {
-    // no echo cancellation / noise suppression: the iPad's call processing is tuned for a voice next
-    // to the device and can swallow a lecturer across the room; quiet sentences are normalised later
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    if (source === 'system') {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true, audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        systemAudio: 'include', selfBrowserSurface: 'exclude', surfaceSwitching: 'include',
+      });
+      if (!stream.getAudioTracks().length) {
+        stream.getTracks().forEach((t) => t.stop());
+        const e = new Error('no audio');
+        e.name = 'NoAudio';
+        throw e;
+      }
+    } else {
+      // no echo cancellation / noise suppression: the call processing of tablets and laptops is tuned for a
+      // voice next to the device and can swallow a lecturer across the room; quiet sentences are normalised later
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    }
   } catch (e) { ctx.close().catch(() => {}); throw e; }
   try {
     await ctx.audioWorklet.addModule('pcm-worklet.js');
-    const src = ctx.createMediaStreamSource(stream);
+    const src = ctx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
     const node = new AudioWorkletNode(ctx, 'pcm-capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
     const mute = ctx.createGain();
     mute.gain.value = 0;
@@ -760,7 +785,7 @@ async function openCapture(ctx, onPcm) {
     node.connect(mute).connect(ctx.destination);
     node.port.onmessage = (ev) => onPcm(new Int16Array(ev.data.pcm), ev.data.rms);
     if (ctx.state !== 'running') await ctx.resume().catch(() => {});
-    return { ctx, stream, track: stream.getAudioTracks()[0], src, node };
+    return { ctx, stream, track: stream.getAudioTracks()[0], src, node, source };
   } catch (e) {
     stream.getTracks().forEach((t) => t.stop());
     ctx.close().catch(() => {});
@@ -776,9 +801,16 @@ function closeCapture(c) {
   c.stream.getTracks().forEach((t) => t.stop());
   c.ctx.close().catch(() => {});
 }
-function captureError(e) {
+function micHelp() {
+  if (PLATFORM.ios) return '麦克风权限被拒绝。请点地址栏左侧的“大小”按钮 → 网站设置 → 麦克风 → 允许（或到“设置 → App → Safari → 麦克风”），再点开始录音。';
+  if (PLATFORM.safari) return '麦克风权限被拒绝。请在 Safari 菜单 → 设置 → 网站 → 麦克风里，把这个网站改成“允许”，再点开始录音。';
+  return '麦克风权限被拒绝。请点地址栏左边的图标 → 网站设置 → 麦克风 → 允许，再点开始录音。'
+    + (PLATFORM.mac ? '（Mac 还要在“系统设置 → 隐私与安全性 → 麦克风”里打开这个浏览器的权限。）' : '');
+}
+function captureError(e, source = 'mic') {
   const n = e && e.name;
-  if (n === 'NotAllowedError') return '麦克风权限被拒绝。请点地址栏左侧的“大小”按钮 → 网站设置 → 麦克风 → 允许（或到 iPad 的“设置 → App → Safari → 麦克风”），再点开始录音。';
+  if (n === 'NoAudio') return '没有拿到声音：共享时要打开“共享标签页音频”（选标签页时）或“共享系统音频”（选整个屏幕时），再点开始录音。';
+  if (n === 'NotAllowedError') return source === 'system' ? '已取消共享。要录网课的声音，点开始录音后选课程所在的标签页并打开“共享标签页音频”。' : micHelp();
   if (n === 'SecurityError') return '这个页面要通过 https 打开才能使用麦克风。';
   if (n === 'NotFoundError' || n === 'OverconstrainedError') return '找不到麦克风。';
   if (n === 'NotReadableError' || n === 'AbortError') return '麦克风正被别的 App 占用（例如通话、录音或视频会议），关掉后再试。';
@@ -1003,7 +1035,7 @@ function onClassPcm(pcm, rms) {
   recordAudio(R.rec, pcm, t, false);
   if (S.pause) return;
   S.seg.push(pcm, rms, clockNow());
-  $('#live').classList.toggle('speaking', S.seg.inSpeech);
+  if (S.seg.inSpeech !== S.speaking) { S.speaking = S.seg.inSpeech; $('#live').classList.toggle('speaking', S.speaking); renderPiP(); }
 }
 function pauseBegin(reason) {
   if (!S.run || S.pause || !S.cap) return;
@@ -1044,7 +1076,8 @@ async function resumeCapture() {
   }
   const ctx = makeContext();
   let nc;
-  try { nc = await openCapture(ctx, onClassPcm); } catch (e) { banner(captureError(e), 'error', { label: '再试一次', fn: resumeCapture }); return; }
+  const source = c ? c.source : (S.set.source || 'mic');
+  try { nc = await openCapture(ctx, onClassPcm, source); } catch (e) { banner(captureError(e, source), 'error', { label: '再试一次', fn: resumeCapture }); return; }
   const wall = (performance.now() - P.wall0) / 1000;
   const kept = c ? Math.max(0, c.ctx.currentTime - P.ctx0) : 0;
   closeCapture(c);
@@ -1110,6 +1143,7 @@ function dropSeg(rec, seg) {
   S.byId.delete(seg.id);
   if (S.latestId === seg.id) setLatest();
   if (!rec.segs.length && !rec.gaps.length) $('#empty').classList.remove('hidden');
+  renderPiP();
 }
 async function translate(rec, seg) {
   if (!llmReady()) {                       // captions still come; translation waits for the settings
@@ -1256,6 +1290,7 @@ function paintSeg(seg) {
   $('.txt', el).textContent = tr;
   $('.retry-btn', el).textContent = st === 'sttError' ? '重新识别' : '重试翻译';
   scrollDown();
+  renderPiP();
 }
 function paintTr(seg) {
   const el = S.els.get(seg.id);
@@ -1264,6 +1299,7 @@ function paintTr(seg) {
   el.classList.add('streaming');
   $('.txt', el).textContent = seg.tr;
   scrollDown();
+  renderPiP();
 }
 function addGapRow(g, quiet = false) {
   $('#empty').classList.add('hidden');
@@ -1389,7 +1425,7 @@ async function start(fresh = false) {
   if (S.run || S.starting || S.stopping) return;
   if (!sttReady()) { toast('先在设置里设置好语音识别服务（密钥）'); openSettings(); return; }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.AudioWorkletNode) {
-    banner('这个浏览器不能在网页里录音。请用 iPad 上最新的 Safari 打开（需要 https 地址）。', 'error');
+    banner('这个浏览器不能在网页里录音。请用最新的 Safari、Chrome 或 Edge 打开（需要 https 地址）。', 'error');
     return;
   }
   let ctx;
@@ -1399,10 +1435,11 @@ async function start(fresh = false) {
   setRunUI('starting');
   hideBanner();
   let cap;
-  try { cap = await openCapture(ctx, onClassPcm); } catch (e) {
+  const source = CAN_SYSTEM_AUDIO && S.set.source === 'system' ? 'system' : 'mic';
+  try { cap = await openCapture(ctx, onClassPcm, source); } catch (e) {
     S.starting = false;
     setRunUI('idle');
-    banner(captureError(e), 'error');
+    banner(captureError(e, source), 'error');
     return;
   }
   let rec = S.record;
@@ -1411,6 +1448,7 @@ async function start(fresh = false) {
   rec.direction = S.set.direction;
   rec.sttModel = sttLabel();
   rec.trModel = llmLabel();
+  $('#source-label').textContent = cap.source === 'system' ? '电脑声音' : '麦克风';
   if (!rec.course) rec.course = S.set.course;
   if (!llmReady()) banner('翻译服务还没设置好（密钥或模型），现在只显示识别出的原文。到“设置”里补上后，可以在句子上点“重试翻译”。', 'warn', { label: '打开设置', fn: openSettings });
   S.cap = cap;
@@ -1467,7 +1505,7 @@ async function stop() {
   await finalize(rec);
   S.stopping = false;
   setRunUI('idle');
-  if (rec === S.record) toast('这一份已保存在 iPad 上；可以在「以前的记录」里导出');
+  if (rec === S.record) toast('这一份已保存在这台设备上；可以在「以前的记录」里导出');
 }
 // “新录音”: this record is finished (it is already saved) and a fresh one starts recording at once.
 // While recording, the microphone keeps running: no gap between the two, no new permission prompt.
@@ -1475,7 +1513,7 @@ function newRecording() {
   if (S.stopping || S.starting) { toast('稍等一下再开始新录音'); return; }
   const has = S.record && S.record.segs.length > 0;
   if (has && !confirm(S.run ? '结束这一份录音（已经自动保存），马上开始新录音？'
-    : '开始一份新的录音？这一份已经保存在这台 iPad 上；私下的问答不会带过去。')) return;
+    : '开始一份新的录音？这一份已经保存在这台设备上；私下的问答不会带过去。')) return;
   if (!S.run) { start(true); return; }
   if (S.dict && S.dict.same) finishVoice();
   const old = S.run.rec;
@@ -1516,18 +1554,19 @@ function setRunUI(mode) {
   $('#lat-k').textContent = mode !== 'recording' && S.lat.length ? '最近延迟' : '延迟';
   $('#timer').textContent = mmss(clockNow());
   renderPlayer();
+  renderPiP();
 }
 async function keepAwake(on) {
   if (!on) { if (S.wake) S.wake.release().catch(() => {}); S.wake = null; return; }
   if (!('wakeLock' in navigator)) {
-    $('#keep-on').textContent = '录音时请让这个页面留在前台，并把“自动锁定”调长';
+    $('#keep-on').textContent = PLATFORM.desktop ? KEEP_DESKTOP : '录音时请让这个页面留在前台，并把“自动锁定”调长';
     return;
   }
   try {
     S.wake = await navigator.wakeLock.request('screen');
-    $('#keep-on').textContent = '录音时请让这个页面留在前台；屏幕会保持常亮';
+    $('#keep-on').textContent = PLATFORM.desktop ? KEEP_DESKTOP : '录音时请让这个页面留在前台；屏幕会保持常亮';
   } catch {
-    $('#keep-on').textContent = '录音时请让这个页面留在前台，并把“自动锁定”调长';
+    $('#keep-on').textContent = PLATFORM.desktop ? KEEP_DESKTOP : '录音时请让这个页面留在前台，并把“自动锁定”调长';
   }
 }
 function tick() {
@@ -1656,9 +1695,106 @@ function setBig(on) {
   document.body.classList.toggle('big', on);
   $('#btn-big').classList.toggle('on', on);
   $('#btn-big').setAttribute('aria-pressed', String(on));
+  $('#btn-big2').setAttribute('aria-pressed', String(on));
   store.set('big', on);
   if (on) { if (S.picker) closePicker(); if (S.view !== 'cap') setView('cap'); }
   scrollDown(true);
+}
+
+// ------------------------------------------------------------------ 悬浮字幕 (desktop Chrome/Edge)
+// An always-on-top caption window (Document Picture-in-Picture) to put over slides or an online class.
+// Class captions only: private questions never go there. Redrawn directly from the caption updates,
+// so it keeps up while this page is behind other windows.
+const PIP_CSS = `
+  html, body { margin: 0; height: 100%; background: #161616; color: #fff; overflow: hidden;
+    font-family: -apple-system, "PingFang SC", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; }
+  .pip { height: 100%; box-sizing: border-box; padding: 10px 16px 12px; display: flex; flex-direction: column;
+    justify-content: flex-end; gap: 4px; font-size: clamp(16px, 6.2vh + 1.1vw, 50px); line-height: 1.35; }
+  .prev { color: rgba(255,255,255,.5); font-size: .72em; }
+  .cur { font-weight: 600; }
+  .cur.wait { color: rgba(255,255,255,.62); font-weight: 400; font-size: .8em; }
+  .live { color: rgba(255,255,255,.45); font-size: .46em; min-height: 1.3em; }
+  .live::before { content: "● "; color: #d9f26b; }
+  .live:empty::before { content: ""; }
+`;
+async function togglePiP() {
+  if (S.pip) { S.pip.close(); return; }
+  if (!CAN_PIP) { toast('这个浏览器不支持悬浮字幕，请用 Chrome 或 Edge 打开'); return; }
+  try {
+    const w = await window.documentPictureInPicture.requestWindow({ width: 820, height: 210 });
+    const st = w.document.createElement('style');
+    st.textContent = PIP_CSS;
+    w.document.head.appendChild(st);
+    w.document.title = '悬浮字幕';
+    w.document.body.innerHTML = '<div class="pip"><div class="prev"></div><div class="cur"></div><div class="live"></div></div>';
+    S.pip = w;
+    $('#btn-pip').classList.add('on');
+    $('#btn-pip').setAttribute('aria-pressed', 'true');
+    w.addEventListener('pagehide', () => {
+      S.pip = null;
+      $('#btn-pip').classList.remove('on');
+      $('#btn-pip').setAttribute('aria-pressed', 'false');
+    });
+    renderPiP();
+  } catch (e) {
+    banner(`打不开悬浮字幕：${errText(e)}`, 'error');
+  }
+}
+function renderPiP() {
+  if (!S.pip) return;
+  const d = S.pip.document;
+  const segs = textSegs().slice(-2);
+  const shown = (s) => (s.state === 'same' ? s.src : (s.tr || ''));
+  const cur = segs[segs.length - 1], prev = segs.length > 1 ? segs[0] : null;
+  $('.prev', d).textContent = prev ? (shown(prev) || prev.src) : '';
+  const curEl = $('.cur', d);
+  if (cur && !shown(cur)) { curEl.textContent = cur.src; curEl.className = 'cur wait'; } else {
+    curEl.textContent = cur ? shown(cur) : (S.run ? '正在听…' : '开始录音后，字幕会显示在这里');
+    curEl.className = cur ? 'cur' : 'cur wait';
+  }
+  const all = S.record ? S.record.segs : [];
+  const last = all[all.length - 1];
+  $('.live', d).textContent = !S.run ? '' : last && last.state === 'recognizing' ? '识别中…' : S.speaking ? '有人在说话…' : '';
+}
+
+// ------------------------------------------------------------------ platform: install tip, desktop extras
+function setupPlatform() {
+  const b = document.body;
+  b.classList.toggle('can-pip', CAN_PIP);
+  b.classList.toggle('desktop', PLATFORM.desktop);
+  $('#btn-pip').classList.toggle('hidden', !CAN_PIP);
+  $('#btn-big2').classList.toggle('hidden', !CAN_PIP);                  // 大字幕 moves into 显示选项
+  $('#source-field').classList.toggle('hidden', !CAN_SYSTEM_AUDIO);
+  if (PLATFORM.desktop) { $('#keep-on').textContent = KEEP_DESKTOP; $('#tip-front').textContent = '录音时不要关掉这个页面，可以切到别的窗口。'; }
+  const tip = $('#tip-install-text'), side = $('#tip-side');
+  if (PLATFORM.ios) {
+    // kept as written in the page: 分享 → 添加到主屏幕
+  } else if (PLATFORM.safari) {
+    tip.innerHTML = '建议在 Safari 菜单栏点 <b>文件 → 添加到程序坞</b>，以后从程序坞打开，像一个单独的应用。（从程序坞打开后需要重新填一次密钥。）';
+  } else if (PLATFORM.desktop) {
+    tip.innerHTML = '可以把它装成电脑上的应用：点地址栏右侧的 <b>安装</b> 图标（或浏览器菜单里的“将此站点作为应用安装”），以后从桌面、开始菜单或启动台打开。';
+  } else {
+    $('#tip-home').classList.add('hidden');
+  }
+  if (CAN_PIP) side.innerHTML = '想把字幕放在课件或网课画面上：点顶部的 <b>悬浮字幕</b>，会弹出一个置顶的小字幕窗，可以拖到任何位置。';
+  else if (!PLATFORM.ios) side.innerHTML = '想把字幕放在课件旁边：把浏览器窗口缩小放在旁边，再点 <b>大字幕</b>。';
+  window.addEventListener('beforeinstallprompt', (e) => {          // Chrome/Edge: a one-click install button
+    e.preventDefault();
+    S.installEvt = e;
+    $('#btn-install').classList.remove('hidden');
+  });
+  window.addEventListener('appinstalled', () => {
+    S.installEvt = null;
+    $('#btn-install').classList.add('hidden');
+    toast('已安装：以后可以从桌面、开始菜单或启动台打开“课堂翻译”');
+  });
+}
+async function installApp() {
+  const e = S.installEvt;
+  if (!e) { toast('请用地址栏右侧的“安装”图标安装'); return; }
+  S.installEvt = null;
+  $('#btn-install').classList.add('hidden');
+  try { await e.prompt(); } catch { /* the browser decided not to show it */ }
 }
 function updateHeader() {
   const course = (S.record && S.record.course) || S.set.course || '';
@@ -1674,7 +1810,7 @@ function updateNotice() {
   const seen = store.get('qaNoticeSeen', false);
   const n = $('#qa-notice');
   n.classList.toggle('hidden', seen);
-  if (!seen) n.textContent = `发送后，你的问题和选中的字幕会从这台 iPad 直接发给 ${S.set.llmProvider === 'custom' ? hostOf(llmBase()) : llmSvc().label}（${qaModel() || '模型未设置'}）；不会发给老师或同学。`;
+  if (!seen) n.textContent = `发送后，你的问题和选中的字幕会从这台设备直接发给 ${S.set.llmProvider === 'custom' ? hostOf(llmBase()) : llmSvc().label}（${qaModel() || '模型未设置'}）；不会发给老师或同学。`;
 }
 
 // ------------------------------------------------------------------ sentence picker (same as the PC version)
@@ -1850,7 +1986,7 @@ function saveRounds() {
 function restoreRounds() {
   S.rounds.clear();
   S.roundOrder = [];
-  $('#thread').innerHTML = '<p class="muted small thread-empty">在字幕上点<b>问这句</b>，或直接在下面提问；也可以点<b>语音</b>说出问题。问答只在这台 iPad 上，不写进课堂记录。</p>';
+  $('#thread').innerHTML = '<p class="muted small thread-empty">在字幕上点<b>问这句</b>，或直接在下面提问；也可以点<b>语音</b>说出问题。问答只在这台设备上，不写进课堂记录。</p>';
   for (const x of sstore.get(`qa.${recKey()}`, [])) {
     const r = { ...x, refs: x.refs || [], recId: recKey() };
     S.rounds.set(r.qid, r);
@@ -2044,7 +2180,7 @@ async function toggleVoice() {
   if (S.dict) { finishVoice(); return; }
   if (!sttReady()) { toast('先在设置里设置好语音识别服务'); openSettings(); return; }
   const D = { chunks: [], voiced: 0, same: false, cap: null, rec: null, gap0: 0 };
-  if (S.run && S.cap && !S.pause) {
+  if (S.run && S.cap && !S.pause && S.cap.source !== 'system') {            // the class is on this microphone
     D.same = true;
     D.rec = S.run.rec;
     if (S.seg) S.seg.flush(clockNow());
@@ -2111,6 +2247,7 @@ function openSettings() {
   f.glossary.value = s.glossary;
   f.noAI.checked = !!s.noAI;
   f.saveAudio.checked = s.saveAudio !== false;
+  f.source.value = s.source === 'system' && CAN_SYSTEM_AUDIO ? 'system' : 'mic';
   f.silenceMs.value = String(s.silenceMs);
   refreshServiceForm();
   $('#test-result').textContent = '';
@@ -2168,7 +2305,7 @@ function formSettings() {
     llmBase: f.llmBase.value.trim(), trModel: f.trModel.value.trim(), qaModel: f.qaModel.value.trim(),
     sttBase: f.sttBase.value.trim(), sttModel: sp === 'volc' ? '' : f.sttModel.value.trim(),
     direction: f.direction.value, course: f.course.value.trim(), glossary: f.glossary.value.trim(), noAI: f.noAI.checked,
-    saveAudio: f.saveAudio.checked, silenceMs: Number(f.silenceMs.value) || DEFAULTS.silenceMs,
+    saveAudio: f.saveAudio.checked, source: CAN_SYSTEM_AUDIO ? f.source.value : 'mic', silenceMs: Number(f.silenceMs.value) || DEFAULTS.silenceMs,
   };
   for (const [url, what] of [[llmBase(next), '翻译服务'], [sttBase(next), '语音识别']]) {
     if (!url) return { error: `${what}是自定义服务，要填接口地址` };
@@ -2317,7 +2454,7 @@ async function historyAction(act, d) {
   }
 }
 function notesMarkdown(notes) {
-  const L = ['# 我的笔记（课堂翻译 · iPad）', ''];
+  const L = ['# 我的笔记（课堂翻译）', ''];
   const groups = new Map();
   for (const n of notes.slice().sort((a, b) => a.createdAt - b.createdAt)) {
     const k = n.recordId || 'none';
@@ -2350,6 +2487,9 @@ function bind() {
   $('#btn-start').addEventListener('click', () => (S.run ? stop() : start()));
   $('#btn-new').addEventListener('click', newRecording);
   $('#btn-big').addEventListener('click', () => setBig(!document.body.classList.contains('big')));
+  $('#btn-big2').addEventListener('click', () => setBig(!document.body.classList.contains('big')));
+  $('#btn-pip').addEventListener('click', togglePiP);
+  $('#btn-install').addEventListener('click', installApp);
   $('#btn-settings').addEventListener('click', openSettings);
   $('#pill-key').addEventListener('click', openSettings);
   $('#btn-history').addEventListener('click', () => openHistory());
@@ -2462,7 +2602,7 @@ function bind() {
   $('#btn-cancel').addEventListener('click', () => $('#dlg-settings').close());
   $('#btn-test').addEventListener('click', testConnection);
   $('#btn-key-clear').addEventListener('click', () => {
-    if (!confirm('从这台 iPad 删除所有保存的密钥（各个服务的 API Key 和豆包语音的 Access Token）？')) return;
+    if (!confirm('从这台设备删除所有保存的密钥（各个服务的 API Key 和豆包语音的 Access Token）？')) return;
     applySettings({ ...S.set, keys: {}, volcAppId: '' });
     openSettings();
   });
@@ -2488,6 +2628,7 @@ function bind() {
 
 async function init() {
   S.set = loadSettings();
+  setupPlatform();
   bind();
   setSide('qa');
   setView(store.get('view', 'cap'));
@@ -2505,7 +2646,7 @@ async function init() {
   await restoreLatest();
   setRunUI('idle');
   if (!window.isSecureContext) banner('这个页面要通过 https 地址打开，才能使用麦克风。', 'error');
-  else if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) banner('这个浏览器不能在网页里录音，请用 iPad 上的 Safari 打开。', 'error');
+  else if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) banner('这个浏览器不能在网页里录音，请用最新的 Safari、Chrome 或 Edge 打开。', 'error');
   setInterval(tick, 500);
 }
 
